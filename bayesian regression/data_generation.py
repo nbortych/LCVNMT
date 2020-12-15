@@ -79,7 +79,8 @@ def generate_data(N=1000, noise_variation=4, weight_std=1, bias_std=10, sine=Tru
     return return_dict
 
 
-def plot_data(X, Y, w=None, b=None, sine=True, categories=True):
+def plot_data(X=None, Y=None, w=None, b=None, sine=True, categories=True, show=True):
+    assert X is not None and Y is not None, "Please pass the data."
     # scatter the two categories in different colors
     if categories:
         indices = [[X[:, 1] == 0, 0], [X[:, 1] == 1, 0]]
@@ -98,7 +99,8 @@ def plot_data(X, Y, w=None, b=None, sine=True, categories=True):
         dummy_targets = w * dummy_predictors + b
     plt.plot(dummy_predictors.numpy(), dummy_targets.numpy(), color='r')
 
-    plt.show()
+    if show:
+        plt.show()
 
 
 def split_train_target_test_covariate_shift(X, Y, shift_point=5, test_proportion=0.5):
@@ -166,17 +168,18 @@ def get_data(N=1000, sine=False, categories=False, noise_variation=0.4, noise_va
     X, Y, b = data["predictors"], data["target"], data["bias"]
 
     w = data["weight"] if not sine else None
-
+    params_for_plotting = {"X": X, "Y": Y, "w": w, "b": b, "sine": sine, "categories": categories}
     if plot:
-        plot_data(X, Y, w, b, sine=sine, categories=categories)
+        plot_data(**params_for_plotting)
 
     # returns data split into train, (target) and test sets
     if sine:
         train_X, train_Y, target_X, target_Y, test_X, test_Y = split_train_target_test_covariate_shift(X, Y)
-        return train_X, train_Y, target_X, target_Y, test_X, test_Y
     else:
         train_X, train_Y, test_X, test_Y = split_train_target_test_(X, Y, test_proportion=0.2)
-        return train_X, train_Y, None, None, test_X, test_Y
+        target_X, target_Y = None, None
+
+    return train_X, train_Y, target_X, target_Y, test_X, test_Y, params_for_plotting
 
 
 def main():
