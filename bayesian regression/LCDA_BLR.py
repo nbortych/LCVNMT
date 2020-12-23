@@ -104,12 +104,12 @@ def utility_regulariser_classical_lcvi(model, guide, train_X, train_Y, x_target,
     return loss
 
 
-
 def conditional_utility():
     pass
 
+
 def utility_regulariser_categorical(model, guide, train_X, train_Y, utility_on_different_set=False,
-                                    S=2, M=5,
+                                    S=2, M=5, weights=None,
                                     loss_type="SE", EM=False):
     """
     FOR NOW ITS SQUARED LOSS
@@ -131,6 +131,10 @@ def utility_regulariser_categorical(model, guide, train_X, train_Y, utility_on_d
 
     """
     assert loss_type in ['SE'], "Please, specify a valid loss."
+
+    if weights is None:
+        print("Consider specifying utility weights outside the loop!")
+        weights = get_utility_weights(len(train_X[:, 1].unique()), train_X)
 
     if utility_on_different_set:
         # todo somehow pass the
@@ -158,14 +162,10 @@ def utility_regulariser_categorical(model, guide, train_X, train_Y, utility_on_d
         h = torch.mean(predictive_samples.view((S * M, N)), dim=0)
         h = h.unsqueeze(0).expand(S * M, N)
 
-    # If we're using Expectation Maximisation, then sample it again for E step (and then the previous was the M step)
-    if EM:
-        for s in range(S):
-            predictive_samples[s] = predictive(args)['obs']
     # Compute loss
     if loss_type == "SE":
-        loss_fn = torch.nn.MSELoss(reduction='sum')
-        loss = loss_fn(predictive_samples.view((S * M, N)), h)
+        # loss_fn = torch.nn.MSELoss(reduction='sum')
+        loss = torch.sum(weights * (predictive_samples.view((S * M, N)) - h) ** 2)
 
     return loss
 
@@ -177,20 +177,60 @@ def utility_regulariser_categorical(model, guide, train_X, train_Y, utility_on_d
     return (y-h)**2"""
 
 
+def get_utility_weights(num_categories, data):
+    # compute the weigths tensor for each category
+    utility_weights = torch.zeros_like(data[:, 0])
+    # specify the weights
+    weights_per_category = {0: 0, 1: 1}
+    print(f"Weights are {weights_per_category}")
+    assert num_categories >= len(
+        weights_per_category.keys()), f"Please add {num_categories-weights_per_category} categories to the" \
+                                      f" weights_per_category dictionary"
+    for category in range(num_categories):
+        utility_weights[data[:, 1] == category] = weights_per_category[category]
+    return utility_weights
+
+
+# no calibration
+# Final ELBO is 1.17
+# Test ELBO is 1.218475103378296
+# 0,1
+# Final ELBO is 2.23
+# Test ELBO is 1.2486060857772827
+# 0,0
+# Final ELBO is 1.17
+# Test ELBO is 1.2152247428894043
+# 1,0
+# Final ELBO is 3.61
+# Test ELBO is 1.2514504194259644
+# 1,1
+# Final ELBO is 4.61
+# Test ELBO is 1.252934455871582
+
+
+# test on category 1 only
+# no utility
+# Test ELBO is 0.5729303956031799
+# 0,1
+# Test ELBO is 0.6527373790740967
+# todo test on different metric
 def run_train(sine=True, covariate_shift=False, num_categories=2, utility_on_different_set=False, num_iters=1000,
               seed=42):
     train_X, train_Y, test_X, test_Y, params_for_plotting = data_generation.get_data(N=1000,
                                                                                      sine=sine,
-                                                                                     noise_variation=(0.4, 0.3),
+                                                                                     noise_variation=(0.2, 0.9),
                                                                                      categories_proportions=(
                                                                                          0.7, 0.3),
                                                                                      plot=False,
                                                                                      seed=seed,
                                                                                      covariate_shift=covariate_shift,
                                                                                      num_categories=num_categories)
+
+    utility_weights = get_utility_weights(num_categories, train_X)
+
     model, guide = train(train_X, train_Y, num_iters, test_X, test_Y,
                          utility_on_different_set=utility_on_different_set,
-                         seed=seed)
+                         seed=seed, weights=utility_weights)
 
     pred_summary = get_predictive(model, guide, params_for_plotting["X"][:, 0].unsqueeze_(1))
     plot_predictive(pred_summary, params_for_plotting)
@@ -198,7 +238,7 @@ def run_train(sine=True, covariate_shift=False, num_categories=2, utility_on_dif
 
 def train(train_X, train_Y, num_iters=1000, test_X=None, test_Y=None, lr=0.01, seed=42,
           test=False, utility_on_different_set=False, categorical_utility=False, utility_calibration=False, EM=False,
-          lazy_regularisation=None):
+          lazy_regularisation=None, weights=None):
     # PREPARATIONS for training
     # clear param store and seed
     pyro.clear_param_store()
@@ -224,6 +264,10 @@ def train(train_X, train_Y, num_iters=1000, test_X=None, test_Y=None, lr=0.01, s
     optimizer = torch.optim.Adam(guide.parameters(), **{"lr": lr, "betas": (0.90, 0.999)})
     loss_fn = pyro.infer.Trace_ELBO().differentiable_loss
 
+    # utility weigths
+    if utility_calibration and weights is None:
+        weights = get_utility_weights(len(train_X[:, 1].unique()), train_X)
+
     # compute loss
     elbo = []
     for i in range(num_iters + 1):
@@ -234,7 +278,7 @@ def train(train_X, train_Y, num_iters=1000, test_X=None, test_Y=None, lr=0.01, s
             if lazy_regularisation is None or i % lazy_regularisation == 0:
                 loss = loss + utility_regulariser_categorical(model, guide, train_X, train_Y,
                                                               utility_on_different_set=utility_on_different_set,
-                                                              EM=EM)
+                                                              EM=EM, weights=weights)
         loss.backward()
         # take a step and zero the parameter gradients
         optimizer.step()
@@ -248,7 +292,10 @@ def train(train_X, train_Y, num_iters=1000, test_X=None, test_Y=None, lr=0.01, s
 
     # todo do heldout log likelihood on , test_X, test_Y
     if test_X is not None and test_Y is not None:
-        test_args = (test_X[:, 0].unsqueeze_(1), test_Y)
+        # test_args = (test_X[:, 0].unsqueeze_(1), test_Y)
+        mask_category_1 = test_X[:, 1] == 1
+        test_args = (test_X[mask_category_1, 0].unsqueeze_(1), test_Y[mask_category_1])
+
         with torch.no_grad():
             loss = loss_fn(model, guide, *test_args)
         print(f"Test ELBO is {loss/len(test_Y)}")
