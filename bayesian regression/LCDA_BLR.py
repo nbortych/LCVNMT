@@ -42,10 +42,9 @@ def transform_loss_to_utility(loss, method="exp", gamma=1):
     return torch.exp(-loss * gamma)
 
 
-def utility_regulariser(model, guide, train_X, train_Y, x_target, y_target=None, unsupervised_utility=True, S=5, M=10,
-                        loss_type="SE", EM=False):
-    # todo make classification problem
-
+def utility_regulariser_classical_lcvi(model, guide, train_X, train_Y, x_target, y_target=None,
+                                       unsupervised_utility=True, S=2, M=5,
+                                       loss_type="SE", EM=False):
     """
     FOR NOW ITS SQUARED LOSS
     Types of utility:
@@ -74,7 +73,7 @@ def utility_regulariser(model, guide, train_X, train_Y, x_target, y_target=None,
         data = train_X
     # check for dimensionality of data
     assert len(data.shape) == 2, f"Make sure the {'train' if not unsupervised_utility else 'target'}_X" \
-                          f" is of the correct shape: (N,d). Currently it's shaped {train_X.shape}"
+                                 f" is of the correct shape: (N,d). Currently it's shaped {train_X.shape}"
     args = data[:, 0].unsqueeze(1)
     N = args.shape[0]
     loss = 0.0
@@ -103,70 +102,73 @@ def utility_regulariser(model, guide, train_X, train_Y, x_target, y_target=None,
         loss = loss_fn(predictive_samples.view((S * M, N)), h)
 
     return loss
-#
-# def categorical_utility_regulariser(model, guide, train_X, train_Y, x_target, y_target=None, unsupervised_utility=True, S=5, M=10,
-#                         loss_type="SE", EM=False):
-#     # todo make classification problem
-#
-#     """
-#     FOR NOW ITS SQUARED LOSS
-#     Types of utility:
-#     1. Irrespective of y: \int q_{\lambda}(\theta) \log \int p(y \mid \theta, \mathcal{D}) u(y, h) d y d \theta
-#                 1. Sample S \theta from q(\theta).
-#                 2. Sample N predictive ys based on p(y|x,\theta).
-#                 3. Estimate h: closed form for now
-#                 4. Compute u(y,h)
-#
-#     Args:
-#         guide:
-#         train_X:
-#         train_Y:
-#         x_target:
-#         y_target:
-#
-#     Returns:
-#
-#     """
-#     assert loss_type in ['SE'], "Please, specify a valid loss."
-#
-#     if unsupervised_utility:
-#         assert x_target is not None, "Please, pass the unlabeled data."
-#         data = x_target
-#     else:
-#         data = train_X
-#     # check for dimensionality of data
-#     assert len(data.shape) == 2, f"Make sure the {'train' if not unsupervised_utility else 'target'}_X" \
-#                                  f" is of the correct shape: (N,d). Currently it's shaped {train_X.shape}"
-#     args = data
-#     N = args.shape[0]
-#     num_categories = args[:,1].unique()
-#     print(num_categories)
-#     loss = 0.0
-#     predictive_samples = torch.empty(S, M, N)
-#     predictive = Predictive(model, posterior_samples=None, guide=guide,
-#                             num_samples=M, return_sites=['obs'])
-#     # Compute predictive samples
-#     for s in range(S):
-#         predictive_samples[s] = predictive(args)['obs']
-#         # print(predictive_samples[s].shape)
-#
-#     # Compute decision.
-#     if loss_type == "SE":
-#         # The bayes estimator for this loss function is the mean of predictive posterior samples.
-#         # In code of tkusmierczyk in LCVI directory, he uses mean with respect to both theta and predictive
-#         h = torch.mean(predictive_samples.view((S * M, N)), dim=0)
-#         h = h.unsqueeze(0).expand(S * M, N)
-#
-#     # If we're using Expectation Maximisation, then sample it again for E step (and then the previous was the M step)
-#     if EM:
-#         for s in range(S):
-#             predictive_samples[s] = predictive(args)['obs']
-#     # Compute loss
-#     if loss_type == "SE":
-#         loss_fn = torch.nn.MSELoss(reduction='sum')
-#         loss = loss_fn(predictive_samples.view((S * M, N)), h)
-#
-#     return loss
+
+
+
+def conditional_utility():
+    pass
+
+def utility_regulariser_categorical(model, guide, train_X, train_Y, utility_on_different_set=False,
+                                    S=2, M=5,
+                                    loss_type="SE", EM=False):
+    """
+    FOR NOW ITS SQUARED LOSS
+    Types of utility:
+    1. Irrespective of y: \int q_{\lambda}(\theta) \log \int p(y \mid \theta, \mathcal{D}) u(y, h) d y d \theta
+                1. Sample S \theta from q(\theta).
+                2. Sample N predictive ys based on p(y|x,\theta).
+                3. Estimate h: closed form for now
+                4. Compute u(y,h)
+
+    Args:
+        guide:
+        train_X:
+        train_Y:
+        x_target:
+        y_target:
+
+    Returns:
+
+    """
+    assert loss_type in ['SE'], "Please, specify a valid loss."
+
+    if utility_on_different_set:
+        # todo somehow pass the
+        raise NotImplementedError
+    else:
+        data = train_X
+    # check for dimensionality of data
+    assert len(data.shape) == 2, f"Make sure the {'train' if not utility_on_different_set else 'target'}_X" \
+                                 f" is of the correct shape: (N,d). Currently it's shaped {train_X.shape}"
+    args = data[:, 0].unsqueeze(1)
+    N = args.shape[0]
+    loss = 0.0
+    predictive_samples = torch.empty(S, M, N)
+    predictive = Predictive(model, posterior_samples=None, guide=guide,
+                            num_samples=M, return_sites=['obs'])
+    # Compute predictive samples
+    for s in range(S):
+        predictive_samples[s] = predictive(args)['obs']
+        # print(predictive_samples[s].shape)
+
+    # Compute decision.
+    if loss_type == "SE":
+        # The bayes estimator for this loss function is the mean of predictive posterior samples.
+        # In code of tkusmierczyk in LCVI directory, he uses mean with respect to both theta and predictive
+        h = torch.mean(predictive_samples.view((S * M, N)), dim=0)
+        h = h.unsqueeze(0).expand(S * M, N)
+
+    # If we're using Expectation Maximisation, then sample it again for E step (and then the previous was the M step)
+    if EM:
+        for s in range(S):
+            predictive_samples[s] = predictive(args)['obs']
+    # Compute loss
+    if loss_type == "SE":
+        loss_fn = torch.nn.MSELoss(reduction='sum')
+        loss = loss_fn(predictive_samples.view((S * M, N)), h)
+
+    return loss
+
 
 """def squared_loss_optimal_h(ys): 
     return ys.mean(0) #allows gradients through     
@@ -175,24 +177,28 @@ def utility_regulariser(model, guide, train_X, train_Y, x_target, y_target=None,
     return (y-h)**2"""
 
 
-def run_train(sine=True, categories=False, unsupervised_utility=True, num_iters=1000, seed=42):
-    train_X, train_Y, target_X, target_Y, test_X, test_Y, params_for_plotting = data_generation.get_data(N=1000,
-                                                                                                         sine=sine,
-                                                                                                         categories=categories,
-                                                                                                         noise_variation=1.1,
-                                                                                                         noise_variation_2=0.99,
-                                                                                                         plot=False,
-                                                                                                         seed=seed)
-    model, guide = train(train_X, train_Y, num_iters, target_X, target_Y, test_X, test_Y,
-                         unsupervised_utility=unsupervised_utility,
+def run_train(sine=True, covariate_shift=False, num_categories=2, utility_on_different_set=False, num_iters=1000,
+              seed=42):
+    train_X, train_Y, test_X, test_Y, params_for_plotting = data_generation.get_data(N=1000,
+                                                                                     sine=sine,
+                                                                                     noise_variation=(0.4, 0.3),
+                                                                                     categories_proportions=(
+                                                                                         0.7, 0.3),
+                                                                                     plot=False,
+                                                                                     seed=seed,
+                                                                                     covariate_shift=covariate_shift,
+                                                                                     num_categories=num_categories)
+    model, guide = train(train_X, train_Y, num_iters, test_X, test_Y,
+                         utility_on_different_set=utility_on_different_set,
                          seed=seed)
 
-    pred_summary = get_predictive(model, guide, params_for_plotting["X"])
+    pred_summary = get_predictive(model, guide, params_for_plotting["X"][:, 0].unsqueeze_(1))
     plot_predictive(pred_summary, params_for_plotting)
 
 
-def train(train_X, train_Y, num_iters=1000, target_X=None, target_Y=None, test_X=None, test_Y=None, lr=0.01, seed=42,
-          test=False, unsupervised_utility=False, categorical_utility= False, utility_calibration=True, EM=False, lazy_regularisation=None):
+def train(train_X, train_Y, num_iters=1000, test_X=None, test_Y=None, lr=0.01, seed=42,
+          test=False, utility_on_different_set=False, categorical_utility=False, utility_calibration=False, EM=False,
+          lazy_regularisation=None):
     # PREPARATIONS for training
     # clear param store and seed
     pyro.clear_param_store()
@@ -200,11 +206,11 @@ def train(train_X, train_Y, num_iters=1000, target_X=None, target_Y=None, test_X
         torch.manual_seed(seed)
     if test:
         num_iters = 10
-    # Shal we use categories for utility
-    if not categorical_utility:
-        utility_fn = utility_regulariser
-    else:
-        utility_fn = categorical_utility_regulariser
+    # # Shal we use categories for utility
+    # if not categorical_utility:
+    #     utility_fn = utility_regulariser
+    # else:
+    #     utility_fn = categorical_utility_regulariser
 
     # initialise model and guide
     model = BayesianRegression(1, 1)
@@ -226,9 +232,9 @@ def train(train_X, train_Y, num_iters=1000, target_X=None, target_Y=None, test_X
 
         if utility_calibration:
             if lazy_regularisation is None or i % lazy_regularisation == 0:
-                loss = loss + utility_fn(model, guide, train_X, train_Y, target_X, target_Y,
-                                                  unsupervised_utility,
-                                                  EM=EM)
+                loss = loss + utility_regulariser_categorical(model, guide, train_X, train_Y,
+                                                              utility_on_different_set=utility_on_different_set,
+                                                              EM=EM)
         loss.backward()
         # take a step and zero the parameter gradients
         optimizer.step()
@@ -237,12 +243,12 @@ def train(train_X, train_Y, num_iters=1000, target_X=None, target_Y=None, test_X
         iter_loss = loss.item() / train_X.shape[0]
         elbo.append(iter_loss)
         if i % (1 if test else 100) == 0:
-            print(f"[{i :4d}/{num_iters}] ELBO: {iter_loss:.4f}")
+            print(f"[{i :4d}/{num_iters}] {'Utility calibrated'if utility_calibration else ''} ELBO: {iter_loss:.4f}")
     print(f"Final ELBO is {elbo[-1]:.2f}")
 
     # todo do heldout log likelihood on , test_X, test_Y
     if test_X is not None and test_Y is not None:
-        test_args = (test_X, test_Y)
+        test_args = (test_X[:, 0].unsqueeze_(1), test_Y)
         with torch.no_grad():
             loss = loss_fn(model, guide, *test_args)
         print(f"Test ELBO is {loss/len(test_Y)}")

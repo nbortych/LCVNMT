@@ -11,19 +11,42 @@ import matplotlib.pyplot as plt
 #     return reversed_idices
 
 
-def generate_data(N=1000, noise_variation=4, weight_std=1, bias_std=10, sine=True, categories=True,
-                  category_2_proportion=0.2, category_2_noise_variation=8):
+def assertion_error(num_categories, tuple_of_interest, argument_type="noise_variation"):
+    assert argument_type in ['noise_variation', 'categories_proportions']
+    objects_of_interest = {'noise_variation': 'noises', 'categories_proportions': 'categories proportions'}
+    error = f"Sorry, you are trying to generate {num_categories} categories," \
+            f"but have only specified {len(tuple_of_interest)} {objects_of_interest[argument_type]}." \
+            f" Please, specify the remaining  {objects_of_interest[argument_type]} through {argument_type}" \
+            f" argument by adding more floats to the tuple."
+    return error
+
+
+def renormalise_proportions(proportions):
+    denominator = sum(proportions)
+    categories_proportions = [proportion / denominator for proportion in proportions]
+    return categories_proportions
+
+
+def proportions_to_points(proportions, N):
+    return list(map(lambda x: int(torch.clamp(torch.tensor(x), 0, 1) * N), proportions))
+
+
+def generate_data(N=1000, noise_variation=(0.9, 0.3, 0.1), weight_std=1, bias_std=10, sine=True,
+                  sine_covariate_shift=True, num_categories=3,
+                  categories_proportions=(0.55, 0.25, 0.2)):
     """
 
     Args:
         N (int): Number of data points.
-        noise_variation (float): sigma for Gaussian noise added to points(of the first category).
+        noise_variation (tuple of floats): sigma for Gaussian noise added to points(of the first category).
         weight_std (float): sigma of Gaussian that samples the weight.
         bias_std (float): sigma of Gaussian that samples the bias.
         sine (bool): if True, sine function is the basis, otherwise linear.
-        categories (bool): if True, data is split into two categories with different noise.
-        category_2_proportion (float): number between 0 and 1 that specifies proportion of points of the second category.
-        category_2_noise_variation (float): sigma for Gaussian noise added to points of the second category.
+        sine_covariate_shift (bool): if True, then all the categories except the first one will be after shift.
+        num_categories (int): number of categories.
+        categories_proportions (float or tuple): number between 0 and 1 that specifies proportion of points of the
+                                                second category or a tuple with a convex hull with number of elements = num_categories.
+
 
     Returns:
         (dict): "predictors": the independent variable, covariates used to predict the Y.
@@ -48,30 +71,71 @@ def generate_data(N=1000, noise_variation=4, weight_std=1, bias_std=10, sine=Tru
     X = X.unsqueeze_(1)
 
     # if introducing a categorical variable
-    if categories:
-        # get the number of points
-        num_points_in_category_2 = int(torch.clamp(torch.tensor(category_2_proportion), 0, 1) * N)
-        category_threshold = N - num_points_in_category_2
-        # permute the indices
-        indices = torch.randperm(N)
-        # first element are the first category, second is the second category
-        category_indices = [indices[:category_threshold], indices[category_threshold:]]
+    if num_categories > 1:
+        # assertions to make sure that the parameters for categories are specified correctly
+        assert type(noise_variation) == tuple, "Please, specify a tuple of noise variations"
+        assert num_categories <= len(noise_variation), assertion_error(num_categories, noise_variation,
+                                                                       argument_type="noise_variation")
+        assert num_categories <= len(categories_proportions), assertion_error(num_categories, categories_proportions,
+                                                                              argument_type="categories_proportions")
+        assert sum(categories_proportions) == 1., f"Make sure that categories proportions add up to 1. Currently it's " \
+                                                  f"{ sum(categories_proportions):.4f}."
 
-        # append the categories to the covariates
-        categories_tensor = torch.ones(N).unsqueeze_(1)
-        categories_tensor[category_indices[0]] = 0
-        # now second dimension is 0 if category 1 and 1 if category 2
-        X = torch.cat((X, categories_tensor), dim=1)
+        if num_categories < len(categories_proportions):
+            print(f'There are less categories than proportions ({num_categories}<{len(categories_proportions)}).'
+                  f' Renormalising first {num_categories} elements of the proportions. ')
+            # renormalising
+            categories_proportions = renormalise_proportions(categories_proportions[:num_categories])
+        # just randomely distribute according to the proportion
+        if not sine_covariate_shift:
+            # get the number of points
+            num_points_in_categories = proportions_to_points(categories_proportions, N)
+
+            # make sure there are no rounding errors by adding the surplus to the first category
+            if sum(num_points_in_categories) < N:
+                num_points_in_categories[0] += N - sum(num_points_in_categories)
+                # permute the indices for random split
+            indices = torch.randperm(N)
+            print(indices.shape)
+        # distribute according to the position of the covariate
+        else:
+            shift_point = 5
+            # get the training indices by splitting along the covariate
+            train_idx, shift_idx = (X[:, 0] < shift_point).nonzero()[:, 0], (X[:, 0] > shift_point).nonzero()[:, 0]
+            # the number of points in category 1 is determined by covariate, but the other categories don't have to
+            shift_proportions = renormalise_proportions(categories_proportions[1:])
+            num_points_in_categories = [train_idx.shape[0]] + proportions_to_points(shift_proportions,
+                                                                                    shift_idx.shape[0])
+            # shuffle shift indices
+            shift_idx = shift_idx[torch.randperm(shift_idx.shape[0])]
+            indices = torch.cat((train_idx, shift_idx), dim=0)
+
+        # indices for different categories
+        category_indices, total_points = [], 0
+        for num_points in num_points_in_categories:
+            category_indices.append(indices[total_points:total_points + num_points])
+            total_points += num_points
+
+        # encode categories as categorical data
+        categories_tensor = torch.zeros(N).unsqueeze_(1)
+        for i, category_idx in enumerate(category_indices):
+            categories_tensor[category_idx] = i
+
+        #  append the categories to the covariates
+        # now second dimension encodes the category
+        X = torch.cat((X, categories_tensor), dim=-1)
 
         # adding noise
-        for category_idx, category_variation in zip(category_indices,
-                                                    [noise_variation, category_2_noise_variation]):
+        for category_idx, category_variation in zip(category_indices, noise_variation):
             Y[category_idx] += torch.distributions.Normal(0, category_variation).sample(Y[category_idx].shape)
 
-    else:  # just add noise to Y
-        Y += torch.distributions.Normal(0, noise_variation).sample(Y.shape)
-    print(
-        f"{'True function is sine' if sine else f'True function is linear and weight is: {w:.4}'} and true bias is {b:.4}, true sigma is {noise_variation}")
+    else:  # Append a single category
+        X = torch.cat((X, torch.zeros(N).unsqueeze_(1)), dim=1)
+        # just add noise to Y
+        Y += torch.distributions.Normal(0, noise_variation[0]).sample(Y.shape)
+
+    print(f"{'True function is sine' if sine else f'True function is linear and weight is: {w:.4}'}"
+          f" and true bias is {b:.4}, true sigma is {noise_variation}")
 
     return_dict = {"predictors": X, "target": Y, "bias": b}
     if not sine:
@@ -79,20 +143,21 @@ def generate_data(N=1000, noise_variation=4, weight_std=1, bias_std=10, sine=Tru
     return return_dict
 
 
-def plot_data(X=None, Y=None, w=None, b=None, sine=True, categories=True, show=True):
+def plot_data(X=None, Y=None, w=None, b=None, sine=True, show=True):
     assert X is not None and Y is not None, "Please pass the data."
-    # scatter the two categories in different colors
-    if categories:
-        indices = [[X[:, 1] == 0, 0], [X[:, 1] == 1, 0]]
-        colors = ["blue", "red"]
-        for idx, color in zip(indices, colors):
-            plt.scatter(X[idx].numpy(), Y[idx[0]].numpy(), marker=".", color=color)
-    # just scatter them
-    else:
-        plt.scatter(X.numpy(), Y.numpy(), marker=".")
+    import matplotlib.colors as mcolors
+    # get the categories (always last dimension)
+    categories = X[:, -1].unique(sorted=True)
+    indices = [[X[:, -1] == i, 0] for i in categories]
+    # get the N colors from the color keymap, where N is the number of categories
+    colors = list(mcolors.TABLEAU_COLORS.keys())[:len(categories)]
+
+    # scatter the categories in different colors
+    for idx, color in zip(indices, colors):
+        plt.scatter(X[idx].numpy(), Y[idx[0]].numpy(), marker=".", color=color[4:])
 
     # plot the 'true' function on the whole range of the domain :)
-    dummy_predictors = torch.linspace(X[:, 0].min(), X[:, 0].max(), steps=4)
+    dummy_predictors = torch.linspace(X[:, 0].min(), X[:, 0].max(), steps=100)
     if sine:
         dummy_targets = np.sin(dummy_predictors) + b
     else:
@@ -159,31 +224,32 @@ def split_train_target_test_(X, Y, test_proportion=0.2):
     return train_X, train_Y, test_X, test_Y
 
 
-def get_data(N=1000, sine=False, categories=False, noise_variation=0.4, noise_variation_2=2, plot=True, seed=None):
+def get_data(N=1000, sine=False, noise_variation=(0.4, 0.3, 0.1), plot=True,
+             seed=None, covariate_shift=False, num_categories=2, categories_proportions=(0.5, 0.5)):
     if seed is not None:
         torch.manual_seed(seed)
 
-    data = generate_data(N=N, noise_variation=noise_variation, sine=sine, categories=categories,
-                         category_2_noise_variation=noise_variation_2)
+    data = generate_data(N=N, sine=sine, noise_variation=noise_variation, sine_covariate_shift=covariate_shift,
+                         num_categories=num_categories, categories_proportions=categories_proportions)
     X, Y, b = data["predictors"], data["target"], data["bias"]
 
     w = data["weight"] if not sine else None
-    params_for_plotting = {"X": X, "Y": Y, "w": w, "b": b, "sine": sine, "categories": categories}
+    params_for_plotting = {"X": X, "Y": Y, "w": w, "b": b, "sine": sine}
     if plot:
         plot_data(**params_for_plotting)
 
     # returns data split into train, (target) and test sets
-    if sine:
+    if covariate_shift:  # todo fix
         train_X, train_Y, target_X, target_Y, test_X, test_Y = split_train_target_test_covariate_shift(X, Y)
     else:
         train_X, train_Y, test_X, test_Y = split_train_target_test_(X, Y, test_proportion=0.2)
         target_X, target_Y = None, None
 
-    return train_X, train_Y, target_X, target_Y, test_X, test_Y, params_for_plotting
+    return train_X, train_Y, test_X, test_Y, params_for_plotting
 
 
 def main():
-    get_data(plot=True, categories=True, sine=True)
+    get_data(plot=True, sine=True)
 
 
 if __name__ == "__main__":
