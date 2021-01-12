@@ -42,75 +42,72 @@ def transform_loss_to_utility(loss, method="exp", gamma=1):
     return torch.exp(-loss * gamma)
 
 
-def utility_regulariser_classical_lcvi(model, guide, train_X, train_Y, x_target, y_target=None,
-                                       unsupervised_utility=True, S=2, M=5,
-                                       loss_type="SE", EM=False):
-    """
-    FOR NOW ITS SQUARED LOSS
-    Types of utility:
-    1. Irrespective of y: \int q_{\lambda}(\theta) \log \int p(y \mid \theta, \mathcal{D}) u(y, h) d y d \theta
-                1. Sample S \theta from q(\theta).
-                2. Sample N predictive ys based on p(y|x,\theta).
-                3. Estimate h: closed form for now
-                4. Compute u(y,h)
-
-    Args:
-        guide:
-        train_X:
-        train_Y:
-        x_target:
-        y_target:
-
-    Returns:
-
-    """
-    assert loss_type in ['SE'], "Please, specify a valid loss."
-
-    if unsupervised_utility:
-        assert x_target is not None, "Please, pass the unlabeled data."
-        data = x_target
-    else:
-        data = train_X
-    # check for dimensionality of data
-    assert len(data.shape) == 2, f"Make sure the {'train' if not unsupervised_utility else 'target'}_X" \
-                                 f" is of the correct shape: (N,d). Currently it's shaped {train_X.shape}"
-    args = data[:, 0].unsqueeze(1)
-    N = args.shape[0]
-    loss = 0.0
-    predictive_samples = torch.empty(S, M, N)
-    predictive = Predictive(model, posterior_samples=None, guide=guide,
-                            num_samples=M, return_sites=['obs'])
-    # Compute predictive samples
-    for s in range(S):
-        predictive_samples[s] = predictive(args)['obs']
-        # print(predictive_samples[s].shape)
-
-    # Compute decision.
-    if loss_type == "SE":
-        # The bayes estimator for this loss function is the mean of predictive posterior samples.
-        # In code of tkusmierczyk in LCVI directory, he uses mean with respect to both theta and predictive
-        h = torch.mean(predictive_samples.view((S * M, N)), dim=0)
-        h = h.unsqueeze(0).expand(S * M, N)
-
-    # If we're using Expectation Maximisation, then sample it again for E step (and then the previous was the M step)
-    if EM:
-        for s in range(S):
-            predictive_samples[s] = predictive(args)['obs']
-    # Compute loss
-    if loss_type == "SE":
-        loss_fn = torch.nn.MSELoss(reduction='sum')
-        loss = loss_fn(predictive_samples.view((S * M, N)), h)
-
-    return loss
-
-
-def conditional_utility():
-    pass
+#
+# def utility_regulariser_classical_lcvi(model, guide, train_X, train_Y, x_target, y_target=None,
+#                                        unsupervised_utility=True, S=2, M=5,
+#                                        loss_type="SE", EM=False):
+#     """
+#     FOR NOW ITS SQUARED LOSS
+#     Types of utility:
+#     1. Irrespective of y: \int q_{\lambda}(\theta) \log \int p(y \mid \theta, \mathcal{D}) u(y, h) d y d \theta
+#                 1. Sample S \theta from q(\theta).
+#                 2. Sample N predictive ys based on p(y|x,\theta).
+#                 3. Estimate h: closed form for now
+#                 4. Compute u(y,h)
+#
+#     Args:
+#         guide:
+#         train_X:
+#         train_Y:
+#         x_target:
+#         y_target:
+#
+#     Returns:
+#
+#     """
+#     assert loss_type in ['SE'], "Please, specify a valid loss."
+#
+#     if unsupervised_utility:
+#         assert x_target is not None, "Please, pass the unlabeled data."
+#         data = x_target
+#     else:
+#         data = train_X
+#     # check for dimensionality of data
+#     assert len(data.shape) == 2, f"Make sure the {'train' if not unsupervised_utility else 'target'}_X" \
+#                                  f" is of the correct shape: (N,d). Currently it's shaped {train_X.shape}"
+#     args = data[:, 0].unsqueeze(1)
+#     N = args.shape[0]
+#     loss = 0.0
+#     predictive_samples = torch.empty(S, M, N)
+#     predictive = Predictive(model, posterior_samples=None, guide=guide,
+#                             num_samples=M, return_sites=['obs'])
+#     # Compute predictive samples
+#     for s in range(S):
+#         predictive_samples[s] = predictive(args)['obs']
+#         # print(predictive_samples[s].shape)
+#
+#     # Compute decision.
+#     if loss_type == "SE":
+#         # The bayes estimator for this loss function is the mean of predictive posterior samples.
+#         # In code of tkusmierczyk in LCVI directory, he uses mean with respect to both theta and predictive
+#         h = torch.mean(predictive_samples.view((S * M, N)), dim=0)
+#         h = h.unsqueeze(0).expand(S * M, N)
+#
+#     # If we're using Expectation Maximisation, then sample it again for E step (and then the previous was the M step)
+#     if EM:
+#         for s in range(S):
+#             predictive_samples[s] = predictive(args)['obs']
+#     # Compute loss
+#     if loss_type == "SE":
+#         loss_fn = torch.nn.MSELoss(reduction='sum')
+#         loss = loss_fn(predictive_samples.view((S * M, N)), h)
+#
+#     return loss
 
 
-def utility_regulariser_categorical(model, guide, train_X, train_Y, utility_on_different_set=False,
+def utility_regulariser_categorical(model, guide, train_X, train_Y,
                                     S=2, M=5, weights=None,
-                                    loss_type="SE", EM=False):
+                                    loss_type="AE", EM=False, loss_to_utility=False):
     """
     FOR NOW ITS SQUARED LOSS
     Types of utility:
@@ -130,21 +127,17 @@ def utility_regulariser_categorical(model, guide, train_X, train_Y, utility_on_d
     Returns:
 
     """
-    assert loss_type in ['SE'], "Please, specify a valid loss."
+    assert loss_type in ['SE', 'AE'], "Please, specify a valid loss."
 
-    if weights is None:
-        print("Consider specifying utility weights outside the loop!")
-        weights = get_utility_weights(len(train_X[:, 1].unique()), train_X)
+    if type(weights) == dict:
+        weights = get_utility_weights(len(train_X[:, 1].unique()), train_X, weights_per_category=weights)
+    elif weights is None:
+        weights = 1
 
-    if utility_on_different_set:
-        # todo somehow pass the
-        raise NotImplementedError
-    else:
-        data = train_X
     # check for dimensionality of data
-    assert len(data.shape) == 2, f"Make sure the {'train' if not utility_on_different_set else 'target'}_X" \
-                                 f" is of the correct shape: (N,d). Currently it's shaped {train_X.shape}"
-    args = data[:, 0].unsqueeze(1)
+    assert len(
+        train_X.shape) == 2, f"Make sure the train_X is of the correct shape: (N,d). Currently it's shaped {train_X.shape}"
+    args = train_X[:, 0].unsqueeze(1)
     N = args.shape[0]
     loss = 0.0
     predictive_samples = torch.empty(S, M, N)
@@ -159,14 +152,21 @@ def utility_regulariser_categorical(model, guide, train_X, train_Y, utility_on_d
     if loss_type == "SE":
         # The bayes estimator for this loss function is the mean of predictive posterior samples.
         # In code of tkusmierczyk in LCVI directory, he uses mean with respect to both theta and predictive
-        h = torch.mean(predictive_samples.view((S * M, N)), dim=0)
-        h = h.unsqueeze(0).expand(S * M, N)
+        with torch.no_grad():
+            h = torch.mean(predictive_samples.view((S * M, N)), dim=0)
+            h = h.unsqueeze(0).expand(S * M, N)
+    elif loss_type == "AE":
+        with torch.no_grad():
+            h = torch.median(predictive_samples.view((S * M, N)))
 
     # Compute loss
     if loss_type == "SE":
-        # loss_fn = torch.nn.MSELoss(reduction='sum')
         loss = torch.sum(weights * (predictive_samples.view((S * M, N)) - h) ** 2)
+    elif loss_type == "AE":
+        loss = torch.sum(weights * torch.abs(predictive_samples.view((S * M, N)) - h))
 
+    if loss_to_utility:
+        loss = - transform_loss_to_utility(loss)
     return loss
 
 
@@ -177,12 +177,11 @@ def utility_regulariser_categorical(model, guide, train_X, train_Y, utility_on_d
     return (y-h)**2"""
 
 
-def get_utility_weights(num_categories, data):
+def get_utility_weights(num_categories, data, weights_per_category={0: 0, 1: 1}):
     # compute the weigths tensor for each category
     utility_weights = torch.zeros_like(data[:, 0])
     # specify the weights
-    weights_per_category = {0: 0, 1: 1}
-    print(f"Weights are {weights_per_category}")
+
     assert num_categories >= len(
         weights_per_category.keys()), f"Please add {num_categories-weights_per_category} categories to the" \
                                       f" weights_per_category dictionary"
@@ -214,8 +213,9 @@ def get_utility_weights(num_categories, data):
 # 0,1
 # Test ELBO is 0.6527373790740967
 # todo test on different metric
-def run_train(sine=True, covariate_shift=False, num_categories=2, utility_on_different_set=False, num_iters=1000,
-              seed=42):
+def run_train(sine=True, covariate_shift=False, num_categories=2, num_iters=1000,
+              seed=42, weights_per_category={0: 0, 1: 1}, utility_calibration=True, loss_type="SE",
+              loss_to_utility=False):
     train_X, train_Y, test_X, test_Y, params_for_plotting = data_generation.get_data(N=1000,
                                                                                      sine=sine,
                                                                                      noise_variation=(0.2, 0.9),
@@ -225,20 +225,21 @@ def run_train(sine=True, covariate_shift=False, num_categories=2, utility_on_dif
                                                                                      seed=seed,
                                                                                      covariate_shift=covariate_shift,
                                                                                      num_categories=num_categories)
+    print(f"Weights are {weights_per_category}")
 
-    utility_weights = get_utility_weights(num_categories, train_X)
+    utility_weights = get_utility_weights(num_categories, train_X, weights_per_category=weights_per_category)
 
     model, guide = train(train_X, train_Y, num_iters, test_X, test_Y,
-                         utility_on_different_set=utility_on_different_set,
-                         seed=seed, weights=utility_weights)
+                         seed=seed, weights=utility_weights, utility_calibration=utility_calibration,
+                         loss_type=loss_type, loss_to_utility=loss_to_utility)
 
     pred_summary = get_predictive(model, guide, params_for_plotting["X"][:, 0].unsqueeze_(1))
     plot_predictive(pred_summary, params_for_plotting)
 
 
 def train(train_X, train_Y, num_iters=1000, test_X=None, test_Y=None, lr=0.01, seed=42,
-          test=False, utility_on_different_set=False, categorical_utility=False, utility_calibration=False, EM=False,
-          lazy_regularisation=None, weights=None):
+          test=0, categorical_utility=False, utility_calibration=True, EM=False,
+          lazy_regularisation=None, weights={0: 0, 1: 1}, loss_type="SE", loss_to_utility=False):
     # PREPARATIONS for training
     # clear param store and seed
     pyro.clear_param_store()
@@ -264,9 +265,18 @@ def train(train_X, train_Y, num_iters=1000, test_X=None, test_Y=None, lr=0.01, s
     optimizer = torch.optim.Adam(guide.parameters(), **{"lr": lr, "betas": (0.90, 0.999)})
     loss_fn = pyro.infer.Trace_ELBO().differentiable_loss
 
-    # utility weigths
-    if utility_calibration and weights is None:
-        weights = get_utility_weights(len(train_X[:, 1].unique()), train_X)
+    #  utility weigths
+    if utility_calibration and type(weights) == dict:
+        weights = get_utility_weights(len(train_X[:, 1].unique()), train_X, weights_per_category=weights)
+    elif weights is None:
+        weights = 1
+
+    # type of calibration
+    if utility_calibration:
+        type_of_calibration =  "Utility calibrated" if loss_to_utility else "Loss calibrated"
+    else:
+        type_of_calibration = ""
+
 
     # compute loss
     elbo = []
@@ -276,9 +286,11 @@ def train(train_X, train_Y, num_iters=1000, test_X=None, test_Y=None, lr=0.01, s
 
         if utility_calibration:
             if lazy_regularisation is None or i % lazy_regularisation == 0:
+                if type(weights) == dict:
+                    print("Consider specifying utility weights outside the loop!")
                 loss = loss + utility_regulariser_categorical(model, guide, train_X, train_Y,
-                                                              utility_on_different_set=utility_on_different_set,
-                                                              EM=EM, weights=weights)
+                                                              EM=EM, weights=weights, loss_type=loss_type,
+                                                              loss_to_utility=loss_to_utility)
         loss.backward()
         # take a step and zero the parameter gradients
         optimizer.step()
@@ -287,9 +299,20 @@ def train(train_X, train_Y, num_iters=1000, test_X=None, test_Y=None, lr=0.01, s
         iter_loss = loss.item() / train_X.shape[0]
         elbo.append(iter_loss)
         if i % (1 if test else 100) == 0:
-            print(f"[{i :4d}/{num_iters}] {'Utility calibrated'if utility_calibration else ''} ELBO: {iter_loss:.4f}")
-    print(f"Final ELBO is {elbo[-1]:.2f}")
+            print(f"[{i :4d}/{num_iters}] {type_of_calibration} ELBO: {iter_loss:.4f}")
 
+    # RESULTS PRINTING
+
+    print(f"Final parameters are {list(pyro.get_param_store().items())}")
+    print(f"Final {type_of_calibration} ELBO is {elbo[-1]:.2f}")
+    if utility_calibration:
+        with torch.no_grad():
+            final_elbo = loss_fn(model, guide, *model_and_guide_args) / train_X.shape[0]
+        print(f"Final ELBO is {final_elbo:.2f}")
+
+    print(
+        f"Total train {loss_type} {'utility' if loss_to_utility else 'loss'}  is {utility_regulariser_categorical(model, guide, train_X, train_Y, weights={0:1,1:1}, loss_type=loss_type):.2f} and on "
+        f"category 2 train {loss_type} {'utility' if loss_to_utility else 'loss'}  is {utility_regulariser_categorical(model, guide, train_X, train_Y, weights={0:0,1:1}, loss_type=loss_type):.2f}")
     # todo do heldout log likelihood on , test_X, test_Y
     if test_X is not None and test_Y is not None:
         # test_args = (test_X[:, 0].unsqueeze_(1), test_Y)
@@ -298,7 +321,12 @@ def train(train_X, train_Y, num_iters=1000, test_X=None, test_Y=None, lr=0.01, s
 
         with torch.no_grad():
             loss = loss_fn(model, guide, *test_args)
-        print(f"Test ELBO is {loss/len(test_Y)}")
+
+        print(f"Test ELBO is {loss/len(test_Y):.3f}")
+        print(
+            f"Total test {loss_type} {'utility' if loss_to_utility else 'loss'} is {utility_regulariser_categorical(model, guide, test_X, test_Y, weights={0:1,1:1}, loss_type=loss_type):.3f} and on "
+            f"category 2 test {loss_type} {'utility' if loss_to_utility else 'loss'}  is {utility_regulariser_categorical(model, guide, test_X, test_Y, weights={0:0,1:1}, loss_type=loss_type):.3f}")
+
     return model, guide
 
 
