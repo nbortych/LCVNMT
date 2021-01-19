@@ -1,20 +1,103 @@
 from sklearn.model_selection import ParameterGrid
+import wandb
 
 import LCDA_BLR
 
 
-def experiment():
-    param_grid = {'calibration': [True, False], 'weights_per_category': [{0: 0, 1: 1}, {0: 1, 1: 1}]}
+def experiment_local_fast():
+    """
+    Runs the experiment according to params specified in the param_grid.
+    """
+    param_grid = {'calibration': [True, False], 'oracle': [True, False], 'weights_per_category': [{0: 0, 1: 1}]}
     for param in ParameterGrid(param_grid):
-        if param['calibration'] == False and param['weights_per_category'] == param_grid['weights_per_category'][0]:
+        if param['calibration'] == False and param['oracle'] == param_grid['oracle'][0]:
             continue
         print(f"THE PARAMETERS ARE \n {param} \n {'___'*60}")
-        LCDA_BLR.run_train(utility_calibration=param['calibration'], weights_per_category=param['weights_per_category'])
-    list()
+        LCDA_BLR.run_train(utility_calibration=param['calibration'], weights_per_category=param['weights_per_category'],
+                           oracle=param['oracle'])
+
+
+def wandb_experiment():
+    """
+    Makes the wandb sweep according to params in sweep_config.
+    """
+    sweep_config = {
+        'method': 'grid',
+        'parameters': {
+            'utility_calibration': {
+                'values': [True, False]
+            },
+            'weights_per_category': {
+                'values': [{"0": 0, "1": 1}, {"0": 1, "1": 1}]
+            },
+            'sine': {
+                'values': [True, False]
+            },
+            'oracle': {
+                'values': [True, False]
+            }
+        }
+    }
+
+    sweep_id = wandb.sweep(sweep_config, project="lcda_blr")
+    wandb.agent(sweep_id, function=wandb_run)
+
+
+def wandb_run(config=None):
+    """
+    One run of the experiment. Gets config, runs the experiment and logs all the results
+    Args:
+        config (dict): parameters.
+
+    Returns:
+
+    """
+    # init the project
+    wandb.init(project="lcda_blr", config=config)
+    config = wandb.config
+    print(config)
+    # set up parameters
+    if config['sine']:
+        polynomial_degree = 3
+        num_iters = 4000
+    else:
+        polynomial_degree = 1
+        num_iters = 1000
+    # skip meaningless combinations
+    if (not config['utility_calibration'] and config['weights_per_category'] == {"0": 0, "1": 1}) or\
+        (not config['utility_calibration'] and config['oracle']):
+        return
+
+    # run experiment
+    results = LCDA_BLR.run_train(sine=config['sine'], utility_calibration=config['utility_calibration'],
+                                 weights_per_category=config['weights_per_category'],
+                                 oracle=config['oracle'], num_iters=num_iters,  # config['oracle']
+                                 loss_type="SE", polynomial_degree=polynomial_degree, guide_type="diag",
+                                 show_plot=False, test=0)
+    # log the elbo by iteration
+    for elbo in results['elbo']:
+        wandb.log({"elbo": elbo})
+    del results['elbo']
+
+    # log the variational parameters
+    for param_name, param_values in results['variational_params'].items():
+        for i, param_value in enumerate(param_values):
+            wandb.log({f'{param_name}_{i}': param_value})
+    del results['variational_params']
+
+    # turn the plot into an image
+    results['predictive_plt'] = wandb.Image(results['predictive_plt'])
+
+    # log everything
+    wandb.log(results)
+    # wandb.log({"Test Accuracy": correct / total, "Test Loss": loss})
 
 
 def main():
-    experiment()
+    print("AAAA")
+    wandb_experiment()
+    # experiment_local_fast()
+
     # LCDA_BLR.run_train(utility_calibration=True, weights_per_category={0: 0, 1: 10})
 
 

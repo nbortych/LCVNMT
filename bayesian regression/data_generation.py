@@ -11,7 +11,17 @@ import matplotlib.pyplot as plt
 #     return reversed_idices
 
 
-def assertion_error(num_categories, tuple_of_interest, argument_type="noise_variation"):
+def assertion_error_num_categories(num_categories, tuple_of_interest, argument_type="noise_variation"):
+    """
+    Returns text for assertion error for specifying less information than we have the number of categories.
+    Args:
+        num_categories (int): desired number of categories.
+        tuple_of_interest (tuple): tuple with either noises or variation for each category.
+        argument_type (str): which type of problem we're doing
+
+    Returns:
+        error_message (str)
+    """
     assert argument_type in ['noise_variation', 'categories_proportions']
     objects_of_interest = {'noise_variation': 'noises', 'categories_proportions': 'categories proportions'}
     error = f"Sorry, you are trying to generate {num_categories} categories," \
@@ -22,12 +32,29 @@ def assertion_error(num_categories, tuple_of_interest, argument_type="noise_vari
 
 
 def renormalise_proportions(proportions):
+    """
+    Renormalising elements in the passed generator.
+    Args:
+        proportions (tuple/list): proportions to be normalised.
+
+    Returns:
+        categories_proportions (list): renormalised proportions.
+    """
     denominator = sum(proportions)
     categories_proportions = [proportion / denominator for proportion in proportions]
     return categories_proportions
 
 
 def proportions_to_points(proportions, N):
+    """
+    Transfers proportions of N to concrete number of points, which is basically proportions * N.
+    Args:
+        proportions (list): normalised proportions.
+        N (int): total number of points
+
+    Returns:
+        list of points specified by proportions.
+    """
     return list(map(lambda x: int(torch.clamp(torch.tensor(x), 0, 1) * N), proportions))
 
 
@@ -38,7 +65,7 @@ def generate_data(N=1000, noise_variation=(0.9, 0.3, 0.1), weight_std=1, bias_st
 
     Args:
         N (int): Number of data points.
-        noise_variation (tuple of floats): sigma for Gaussian noise added to points(of the first category).
+        noise_variation (tuple of floats): sigmas for Gaussian noise added to points of each category.
         weight_std (float): sigma of Gaussian that samples the weight.
         bias_std (float): sigma of Gaussian that samples the bias.
         sine (bool): if True, sine function is the basis, otherwise linear.
@@ -74,10 +101,10 @@ def generate_data(N=1000, noise_variation=(0.9, 0.3, 0.1), weight_std=1, bias_st
     if num_categories > 1:
         # assertions to make sure that the parameters for categories are specified correctly
         assert type(noise_variation) == tuple, "Please, specify a tuple of noise variations"
-        assert num_categories <= len(noise_variation), assertion_error(num_categories, noise_variation,
-                                                                       argument_type="noise_variation")
-        assert num_categories <= len(categories_proportions), assertion_error(num_categories, categories_proportions,
-                                                                              argument_type="categories_proportions")
+        assert num_categories <= len(noise_variation), assertion_error_num_categories(num_categories, noise_variation,
+                                                                                      argument_type="noise_variation")
+        assert num_categories <= len(categories_proportions), assertion_error_num_categories(num_categories, categories_proportions,
+                                                                                             argument_type="categories_proportions")
         assert sum(categories_proportions) == 1., f"Make sure that categories proportions add up to 1. Currently it's " \
                                                   f"{ sum(categories_proportions):.4f}."
 
@@ -121,7 +148,7 @@ def generate_data(N=1000, noise_variation=(0.9, 0.3, 0.1), weight_std=1, bias_st
         for i, category_idx in enumerate(category_indices):
             categories_tensor[category_idx] = i
 
-        #  append the categories to the covariates
+        #  append the categories variable to the covariate
         # now second dimension encodes the category
         X = torch.cat((X, categories_tensor), dim=-1)
 
@@ -144,6 +171,16 @@ def generate_data(N=1000, noise_variation=(0.9, 0.3, 0.1), weight_std=1, bias_st
 
 
 def plot_data(X=None, Y=None, w=None, b=None, sine=True, show=True):
+    """
+    Plots the data and the underlying functions.
+    Args:
+        X (tensor): Covariates that are plotted on the x-axis. Has information about the categoryies.
+        Y (tensor): Target variable.
+        w (float): weight of the line in case it's linear case.
+        b (float): intercept of the function.
+        sine (bool): whether function is sine or linear.
+        show (bool): whether to show the plot.
+    """
     assert X is not None and Y is not None, "Please pass the data."
     import matplotlib.colors as mcolors
     # get the categories (always last dimension)
@@ -164,6 +201,7 @@ def plot_data(X=None, Y=None, w=None, b=None, sine=True, show=True):
         dummy_targets = w * dummy_predictors + b
     plt.plot(dummy_predictors.numpy(), dummy_targets.numpy(), color='r')
 
+    # do not show yet, if you want to plot additional things
     if show:
         plt.show()
 
@@ -226,6 +264,21 @@ def split_train_target_test_(X, Y, test_proportion=0.2):
 
 def get_data(N=1000, sine=False, noise_variation=(0.4, 0.3, 0.1), plot=True,
              seed=None, covariate_shift=False, num_categories=2, categories_proportions=(0.5, 0.5)):
+    """
+    Generates N points according to either linear or sine function. Points are split into num_categories, each with
+    each own variance specified via noise_variation. Can generate points that have undergone a covariate shift.
+    Splits the points into train and test sets.
+    Args:
+        N (int): Number of data points.
+        sine (bool): if True, sine function is the basis, otherwise linear.
+        noise_variation (tuple of floats): sigmas for Gaussian noise added to points of each category.
+        plot (bool):  if True, will plot the data.
+        seed (int): seed for the RNG.
+        covariate_shift (bool): if True, then all the categories except the first one will be after shift.
+        num_categories (int): number of categories
+        categories_proportions (float or tuple): number between 0 and 1 that specifies proportion of points of the
+                                second category or a tuple with a convex hull with number of elements = num_categories.
+    """
     if seed is not None:
         torch.manual_seed(seed)
 

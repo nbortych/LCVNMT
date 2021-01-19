@@ -9,7 +9,8 @@ __pycache__/
 
 # C extensions
 *.so
-
+bayesian regression/wandb
+/wandb
 # Distribution / packaging
 .Python
 build/
