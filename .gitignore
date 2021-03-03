@@ -1,3 +1,16 @@
+# Data
+NMT/joeynmt/test/data
+NMT/tutorials/seq2seq_tutorial/.data
+NMT/tutorials/transformer_nmt/.data
+NMT/tutorials/translation_tutorial/.data
+NMT/nmt_venv
+
+LCDA/bayesian regression/wandb
+
+LCDA/.idea
+NMT/.idea
+
+NMT/joeynmt/models
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
