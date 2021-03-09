@@ -10,6 +10,14 @@ LCDA/bayesian regression/wandb
 LCDA/.idea
 NMT/.idea
 
+*.egg-info/*
+.idea/*
+build/*
+dist/*
+*.egg-info/*
+docs/build/*
+*__pycache__*
+
 NMT/joeynmt/models
 # Byte-compiled / optimized / DLL files
 __pycache__/
