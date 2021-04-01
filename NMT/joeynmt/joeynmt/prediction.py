@@ -6,8 +6,9 @@ import os
 import sys
 from typing import List, Optional
 import logging
-import numpy as np
+import itertools
 
+import numpy as np
 import torch
 from torchtext.data import Dataset, Field
 
@@ -20,6 +21,12 @@ from joeynmt.batch import Batch
 from joeynmt.data import load_data, make_data_iter, MonoDataset
 from joeynmt.constants import UNK_TOKEN, PAD_TOKEN, EOS_TOKEN
 from joeynmt.vocabulary import Vocabulary
+
+# import os
+# ROOT_DIR = os.path.abspath(os.curdir)
+# print(ROOT_DIR)
+# import ..mbr_nmt.utility as utility
+
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +44,12 @@ def validate_on_data(model: Model, data: Dataset,
                      postprocess: bool = True,
                      bpe_type: str = "subword-nmt",
                      sacrebleu: dict = None,
-                     sample=False,
-                     mbr=False) \
+                     sample: bool = False,
+                     mbr: bool = False,
+                     mbr_type: str = 'editdistance',
+                     small_test_run: bool = False,
+                     num_samples: int = 10,
+                     save_utility_per_sentence: bool = False) \
         -> (float, float, float, List[str], List[List[str]], List[str],
             List[str], List[List[str]], List[np.array]):
     """
@@ -88,6 +99,13 @@ def validate_on_data(model: Model, data: Dataset,
             "this? 'batch_size' is > 1000 for sentence-batching. "
             "Consider decreasing it or switching to"
             " 'eval_batch_type: token'.")
+
+    # if small test run, use subset of the data that is one batch
+    if small_test_run:
+        data, _ = data.split(0.0005)
+        print("The lenght of data is", len(data))
+        # batch_size = len(data)
+
     valid_iter = make_data_iter(
         dataset=data, batch_size=batch_size, batch_type=batch_type,
         shuffle=False, train=False)
@@ -124,7 +142,10 @@ def validate_on_data(model: Model, data: Dataset,
                     model=model, batch=batch, beam_size=beam_size,
                     beam_alpha=beam_alpha, max_output_length=max_output_length, sample=sample)
             else:
-                mbr_decoding(model=model, batch=batch, max_output_length=max_output_length, num_samples=30)
+                output = mbr_decoding(model=model, batch=batch, max_output_length=max_output_length,
+                                      num_samples=num_samples,
+                                      mbr_type=mbr_type)
+                attention_scores = None
 
             # sort outputs back to original order
             all_outputs.extend(output[sort_reverse_index])
@@ -181,8 +202,15 @@ def validate_on_data(model: Model, data: Dataset,
             elif eval_metric.lower() == 'sequence_accuracy':
                 current_valid_score = sequence_accuracy(
                     valid_hypotheses, valid_references)
+            elif eval_metric.lower() == 'meteor':
+                current_valid_score = meteor_utility(
+                    valid_hypotheses, valid_references)
         else:
             current_valid_score = -1
+        # saves utility per sentence. Not implemented yet
+        # todo implement. ask Wilker more about utility
+        if save_utility_per_sentence:
+            get_utility_per_sentence(eval_metric.lower(), valid_hypotheses, valid_references)
 
     return current_valid_score, valid_loss, valid_ppl, valid_sources, \
            valid_sources_raw, valid_references, valid_hypotheses, \
@@ -237,8 +265,11 @@ def parse_test_args(cfg, mode="test"):
             sacrebleu["tokenize"] = cfg["testing"]["sacrebleu"] \
                 .get("tokenize", "13a")
         # whether we sample or greedy
-        sample  = cfg["testing"].get("sample", False)
+        sample = cfg["testing"].get("sample", False)
         mbr = cfg["testing"].get("mbr", False)
+        small_test_run = cfg["testing"].get("small_test_run", False)
+        num_samples = cfg["testing"].get("num_samples", 10)
+        mbr_type = cfg["testing"].get("mbr_type", 'editdistance')
 
     else:
         beam_size = 1
@@ -248,17 +279,22 @@ def parse_test_args(cfg, mode="test"):
         sacrebleu = {"remove_whitespace": True, "tokenize": "13a"}
         sample = False
         mbr = False
-    mbr_text, empty = "MBR_", ""
-    decoding_description = f"{'Greedy decoding' if not sample else f'{mbr_text if mbr else empty}Sample decoding'}" if beam_size < 2 else \
+        small_test_run = False
+        num_samples = 1
+        mbr_type = 'editdistance'
+
+    mbr_text, empty = f"{mbr_type}_MBR_", ""
+    decoding_description = f"{'Greedy decoding' if (not sample and not mbr) else f'{mbr_text if mbr else empty}Sample decoding'}" if beam_size < 2 else \
         "Beam search decoding with beam size = {} and alpha = {}". \
             format(beam_size, beam_alpha)
+
     tokenizer_info = f"[{sacrebleu['tokenize']}]" \
         if eval_metric == "bleu" else ""
 
     return batch_size, batch_type, use_cuda, device, n_gpu, level, \
            eval_metric, max_output_length, beam_size, beam_alpha, \
            postprocess, bpe_type, sacrebleu, decoding_description, \
-           tokenizer_info, sample
+           tokenizer_info, sample, mbr, mbr_type, small_test_run, num_samples
 
 
 # pylint: disable-msg=logging-too-many-args
@@ -267,7 +303,8 @@ def test(cfg_file,
          batch_class: Batch = Batch,
          output_path: str = None,
          save_attention: bool = False,
-         datasets: dict = None) -> None:
+         datasets: dict = None,
+         save_utility_per_sentence: bool = False) -> None:
     """
     Main test function. Handles loading a model from checkpoint, generating
     translations and storing them and attention plots.
@@ -307,7 +344,7 @@ def test(cfg_file,
     # parse test args
     batch_size, batch_type, use_cuda, device, n_gpu, level, eval_metric, \
     max_output_length, beam_size, beam_alpha, postprocess, \
-    bpe_type, sacrebleu, decoding_description, tokenizer_info, sample, mbr \
+    bpe_type, sacrebleu, decoding_description, tokenizer_info, sample, mbr, mbr_type, small_test_run, num_samples \
         = parse_test_args(cfg, mode="test")
 
     # load model state from disk
@@ -339,7 +376,9 @@ def test(cfg_file,
             max_output_length=max_output_length, eval_metric=eval_metric,
             use_cuda=use_cuda, compute_loss=False, beam_size=beam_size,
             beam_alpha=beam_alpha, postprocess=postprocess,
-            bpe_type=bpe_type, sacrebleu=sacrebleu, n_gpu=n_gpu, sample=sample)
+            bpe_type=bpe_type, sacrebleu=sacrebleu, n_gpu=n_gpu, sample=sample, mbr=mbr,
+            small_test_run=small_test_run, num_samples=num_samples, mbr_type=mbr_type,
+            save_utility_per_sentence=save_utility_per_sentence)
         # pylint: enable=unused-variable
 
         if "trg" in data_set.fields:
@@ -421,7 +460,9 @@ def translate(cfg_file: str,
             max_output_length=max_output_length, eval_metric="",
             use_cuda=use_cuda, compute_loss=False, beam_size=beam_size,
             beam_alpha=beam_alpha, postprocess=postprocess,
-            bpe_type=bpe_type, sacrebleu=sacrebleu, n_gpu=n_gpu, sample=sample)
+            bpe_type=bpe_type, sacrebleu=sacrebleu, n_gpu=n_gpu, sample=sample, mbr=mbr,
+            mbr_type=mbr_type,
+            small_test_run=small_test_run, num_samples=num_samples)
         return hypotheses
 
     cfg = load_config(cfg_file)
@@ -456,7 +497,8 @@ def translate(cfg_file: str,
     # parse test args
     batch_size, batch_type, use_cuda, device, n_gpu, level, _, \
     max_output_length, beam_size, beam_alpha, postprocess, \
-    bpe_type, sacrebleu, _, _, sample, mbr = parse_test_args(cfg, mode="translate")
+    bpe_type, sacrebleu, _, _, sample, mbr, mbr_type, small_test_run, \
+    num_samples = parse_test_args(cfg, mode="translate")
 
     # load model state from disk
     model_checkpoint = load_checkpoint(ckpt, use_cuda=use_cuda)
@@ -507,27 +549,89 @@ def translate(cfg_file: str,
                 break
 
 
-def mbr_decoding(model, batch, max_output_length=100, num_samples=10):
-    # define utility function
-    import editdistance
-    utility_fn = editdistance.eval
+def meteor_utility(candidate, sample):
+    from mbr_nmt.utility import parse_utility
+    utility_fn = parse_utility('meteor', lang='en')
+    return utility_fn(hyp=candidate, ref=sample)
 
+
+def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="editdistance"):
     # sample S samples of translation y|x  using  run_batch
-    samples = [run_batch(model, batch, max_output_length=100, beam_size=1, beam_alpha=1, sample=True) for sample in
+    samples = [run_batch(model, batch, max_output_length=max_output_length, beam_size=1, beam_alpha=1, sample=True)[0]
+               for sample in
                range(num_samples)]
+    if mbr_type == "editdistance":
+        import editdistance
+        # define utility function
+        utility_fn = editdistance.eval
 
-    # compute utility matrix
-    U = torch.zeros([num_samples, num_samples])
-    for i, sample_i in enumerate(samples):
-        for j, sample_j in enumerate(samples):
-            if i == j:
-                continue
-            else:
-                U[i, j] = utility_fn(sample_i, sample_j)
-    # get argmax_c of sum^S u(samples, c)
-    expected_uility = torch.mean(U, dim=1)
-    # pick the best candidate
-    best_idx = torch.argmin(expected_uility)
-    prediction = samples[best_idx]
+        # transform indices to str
+        decoded_samples = [model.trg_vocab.arrays_to_sentences(arrays=sample,
+                                                               cut_at_eos=True) for sample in samples]
 
-    return prediction
+        # transform the samples to form of list of of strings #
+        decoded_samples = [" ".join([" ".join(batch) for batch in sample]) for sample in decoded_samples]
+        # initialise utility matrix
+        U = torch.zeros([num_samples, num_samples], dtype=torch.float)
+        # combination of all samples (since utility is symmetrical, we need only AB and not BA samples)
+        combinations_of_samples = itertools.combinations(decoded_samples, r=2)
+        # computing utility of the samples
+        utilities = torch.tensor(list(itertools.starmap(utility_fn, combinations_of_samples))).to(torch.float)
+        # lower triangular and upper indices of the matrix, below the diagonal, since distance(A,A) = 0
+        tril_indices = torch.tril_indices(row=num_samples, col=num_samples, offset=-1)
+        triu_indices = torch.triu_indices(row=num_samples, col=num_samples, offset=1)
+        # setting the values to the matrix
+        U[tril_indices[0], tril_indices[1]] = utilities
+        U[triu_indices[0], triu_indices[1]] = utilities
+        # go through all samples
+        # for i, sample_i in enumerate(decoded_samples):
+        #     for j, sample_j in enumerate(decoded_samples):
+        #         if i == j:
+        #             continue
+        #         else:
+        #             U[i, j] = utility_fn(sample_i, sample_j)
+        # compute utility per candidate
+        expected_uility = torch.mean(U, dim=1)
+        # get argmin_c of sum^S u(samples, c) (min because we want less edit distance)
+        best_idx = torch.argmin(expected_uility)
+        prediction = samples[best_idx]
+
+        return prediction
+    else:
+        from mbr_nmt import mbr, utility
+        utility_fn = utility.parse_utility('meteor', 'en')
+
+        # make it list of batches with list of samples inside: BxSxL
+        print(samples[0].shape, samples[1].shape)
+        batch_first_samples = np.empty((samples[0].shape[0], len(samples), samples[0].shape[1]))
+        print(batch_first_samples.shape)
+
+        for i, sample in enumerate(samples):
+            batch_first_samples[:, i, :] = sample
+
+        # print(batch_first_samples)
+        # print(batch_first_samples.tolist())
+        # each batch is converted to list
+        # string_samples = list(map(lambda batch: list(map(lambda sentence: " ".join(list(map(str, sentence))), batch)), batch_first_samples.tolist()))
+        # todo fix meteor
+        # convert to string in list of lists of lists
+        string_samples = batch_first_samples.astype("U10").tolist()
+        # join the sentences
+        string_samples = list(map(lambda batch: list(map(lambda sample: ' '.join(sample), batch)), string_samples))
+        # string_samples = list(map(lambda sample: list(map(lambda sentence: list(map(str, sentence)), sample.tolist())), samples))
+        print(samples[0].shape)
+        print(string_samples)
+        print(len(string_samples), len(string_samples[0]), len(string_samples[0][0]))
+
+        # string_samples = list(map(lambda sample: list(map(lambda batch: ''.join(list(map(str,batch))) , sample.tolist()) ),big_l))
+        prediction_idx, prediction = mbr.mbr(string_samples, utility_fn)
+        return prediction
+
+
+def get_utility_per_sentence(utility, hyp_samples, ref_samples):
+    # todo
+    raise NotImplementedError
+
+
+if __name__ == "__main__":
+    print(0)

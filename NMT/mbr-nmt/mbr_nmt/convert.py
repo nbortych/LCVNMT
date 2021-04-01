@@ -1,7 +1,13 @@
 import argparse
 from collections import defaultdict
 from tqdm import tqdm
+import sys
+import os
 
+# ROOT_DIR = "/".join(os.path.abspath(os.curdir).split("/")[-1:])
+# print(ROOT_DIR, sys.path)
+# sys.path.append(f'/{ROOT_DIR}')
+# print(sys.path)
 from mbr_nmt.io import wc
 
 def convert(args):

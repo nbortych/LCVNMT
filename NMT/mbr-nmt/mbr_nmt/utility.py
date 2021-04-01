@@ -213,8 +213,9 @@ class METEOR:
         self.proc.stdin.write("SCORE ||| {} ||| {}\n".format(" ".join(ref), " ".join(hyp)).encode("utf-8"))
         self.proc.stdin.flush()
         scores = self.proc.stdout.readline().decode("utf-8").rstrip()
-        # todo check on lisa
-        self.proc.stdin.write("EVAL ||| {}\n".format(scores).replace('.',',').encode("utf-8"))
+        # todo check the replace on lisa
+        print("Meteoring", scores, scores.replace('.',','))
+        self.proc.stdin.write("EVAL ||| {}\n".format(scores.replace('.',',')).encode("utf-8"))
         self.proc.stdin.flush()
         meteor = float(self.proc.stdout.readline().strip())
 

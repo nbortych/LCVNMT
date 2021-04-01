@@ -25,7 +25,7 @@ pip install --user --upgrade pip
 cd $HOME/joeynmt
 pip install --user -r requirements.txt
 pip install --user --editable .
-
+pip install editdistance
 
 # Activate your environment
 # source activate ...

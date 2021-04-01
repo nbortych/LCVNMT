@@ -123,7 +123,7 @@ class Vocabulary:
         return sentence
 
     def arrays_to_sentences(self, arrays: np.array, cut_at_eos=True,
-                            skip_pad=True) -> List[List[str]]:
+                            skip_pad=True, join_sentence = False) -> List[List[str]]:
         """
         Convert multiple arrays containing sequences of token IDs to their
         sentences, optionally cutting them off at the end-of-sequence token.

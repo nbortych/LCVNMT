@@ -1,7 +1,16 @@
 import argparse
+import importlib
+# import os
+# ROOT_DIR = os.path.abspath(os.curdir)
+# roots = ROOT_DIR.split("/")[-3:]
+# print('.'.join(roots))
 
+# translate = importlib.import_module(f"{'.'.join(roots)}.translate")
+# convert = importlib.import_module(f"{'.'.join(roots)}.convert")
 import mbr_nmt.translate as translate
 import mbr_nmt.convert as convert
+
+
 
 def main():
     parser = argparse.ArgumentParser(description="mbr-nmt: minimum Bayes-risk decoding for neural machine translation")

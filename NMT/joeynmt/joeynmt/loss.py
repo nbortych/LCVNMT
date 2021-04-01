@@ -13,7 +13,7 @@ class XentLoss(nn.Module):
     Cross-Entropy Loss with optional label smoothing
     """
 
-    def __init__(self, pad_index: int, smoothing: float = 0.0):
+    def __init__(self, pad_index: int, smoothing: float = 0.0, utility_reguralise= False):
         super().__init__()
         self.smoothing = smoothing
         self.pad_index = pad_index
@@ -24,6 +24,7 @@ class XentLoss(nn.Module):
         else:
             # custom label-smoothed loss, computed with KL divergence loss
             self.criterion = nn.KLDivLoss(reduction='sum')
+        self.utility_regularise = False
 
     def _smooth_targets(self, targets: Tensor, vocab_size: int):
         """
@@ -50,6 +51,9 @@ class XentLoss(nn.Module):
             smooth_dist.index_fill_(0, padding_positions.squeeze(), 0.0)
         return Variable(smooth_dist, requires_grad=False)
 
+    def utiltity_reguralisation(self, predictions, utility):
+        raise NotImplementedError
+
     # pylint: disable=arguments-differ
     def forward(self, log_probs, targets):
         """
@@ -75,4 +79,7 @@ class XentLoss(nn.Module):
             targets = targets.contiguous().view(-1)
         loss = self.criterion(
             log_probs.contiguous().view(-1, log_probs.size(-1)), targets)
+
+        if self.utility_regularise:
+            pass
         return loss

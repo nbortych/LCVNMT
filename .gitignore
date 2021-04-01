@@ -19,6 +19,7 @@ docs/build/*
 *__pycache__*
 
 NMT/joeynmt/models
+NMT/mbr-nmt/test/data
 NMT/mbr-nmt/mbr_nmt/metrics
 # Byte-compiled / optimized / DLL files
 __pycache__/

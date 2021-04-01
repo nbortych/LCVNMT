@@ -1,6 +1,18 @@
 import argparse
 import sys
 
+# import importlib
+# import os
+# ROOT_DIR = os.path.abspath(os.curdir)
+# sys.path.append(f'{ROOT_DIR}')
+# roots = ROOT_DIR.split("/")[-1:]
+# print('.'.join(roots))
+#
+#
+# io = importlib.import_module(f"{'.'.join(roots)}.io")
+# utility_module = importlib.import_module(f"{'.'.join(roots)}.")
+# mbr = importlib.import_module(f"{'.'.join(roots)}.mbr")
+
 from mbr_nmt.io import read_samples_file
 from mbr_nmt.utility import parse_utility
 from mbr_nmt.mbr import mbr
@@ -20,7 +32,7 @@ def translate(args):
     # Run MBR on the entire dataset.
     for sequence_idx, samples in enumerate(S):
         candidates = C[sequence_idx] if C else None
-        pred = mbr(samples, utility, 
+        pred = mbr(samples, utility,
                    candidates=candidates, 
                    return_matrix=False,
                    subsample_size=args.subsample_size)
