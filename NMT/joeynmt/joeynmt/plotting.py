@@ -5,6 +5,7 @@ import numpy as np
 
 # pylint: disable=wrong-import-position
 import matplotlib
+
 matplotlib.use('Agg')
 
 from matplotlib import rcParams
@@ -16,7 +17,6 @@ from matplotlib.backends.backend_pdf import PdfPages
 def plot_heatmap(scores: np.array, column_labels: List[str],
                  row_labels: List[str], output_path: Optional[str] = None,
                  dpi: int = 300) -> Figure:
-
     """
     Plotting function that can be used to visualize (self-)attention.
     Plots are saved if `output_path` is specified, in format that this file
@@ -32,7 +32,7 @@ def plot_heatmap(scores: np.array, column_labels: List[str],
 
     if output_path is not None:
         assert output_path.endswith(".png") or output_path.endswith(".pdf"), \
-        "output path must have .png or .pdf extension"
+            "output path must have .png or .pdf extension"
 
     x_sent_len = len(column_labels)
     y_sent_len = len(row_labels)
@@ -46,9 +46,9 @@ def plot_heatmap(scores: np.array, column_labels: List[str],
     # font config
     rcParams['xtick.labelsize'] = labelsize
     rcParams['ytick.labelsize'] = labelsize
-    #rcParams['font.family'] = "sans-serif"
-    #rcParams['font.sans-serif'] = ["Fira Sans"]
-    #rcParams['font.weight'] = "regular"
+    # rcParams['font.family'] = "sans-serif"
+    # rcParams['font.sans-serif'] = ["Fira Sans"]
+    # rcParams['font.weight'] = "regular"
 
     fig, ax = plt.subplots(figsize=(10, 10), dpi=dpi)
     plt.imshow(scores, cmap='viridis', aspect='equal',
@@ -75,3 +75,37 @@ def plot_heatmap(scores: np.array, column_labels: List[str],
     plt.close()
 
     return fig
+
+
+def get_validation_from_txt(file_path: str, name: str='bleu', decoding_methods = ("mbr", "greedy")):
+    """
+    Transforms the validation logging txt file into dictionary with numpy array as value for plotting, with extracted keys
+    based on the decoding method.
+    Args:
+        file_path (str):  path to the validations.txt file.
+        name (str): name of the statistic of interest.
+
+    """
+    # get the file
+    with open(file_path, mode='r') as f:
+        lines = f.readlines()
+    # initialise dict
+    statistics = {method:[] for method in decoding_methods}
+    statistics['step'] = []
+    len_name = len(name) + 1
+    for line in lines:
+        # track the step
+        statistics['step'] = int(line[6:].split('\t')[0])
+        # find the key we're interested in
+        idx = line.find(name)
+        # strip everything in the beggining away   and split the file
+        split_line = line[idx + len_name:].split('\t')
+        # leave only the numveric value
+        value = float(split_line[0])
+        statistics[split_line[-1].split('\n')[0]].append(value)
+    numpyfied_stats = dict(map(lambda x: (x[0], np.array(x[1])), statistics.items()))
+    return numpyfied_stats
+
+
+if __name__ == "__main__":
+    get_validation_from_txt('models/iwslt14-deen-bpe-transformer_test/validations.txt')
