@@ -34,6 +34,9 @@ from joeynmt.builders import build_optimizer, build_scheduler, \
     build_gradient_clipper
 from joeynmt.prediction import test
 
+# for debug purposes
+# torch.autograd.set_detect_anomaly(True)
+
 # for fp16 training
 try:
     from apex import amp
@@ -68,7 +71,7 @@ class TrainManager:
         assert os.path.exists(self.model_dir)
 
         # are we really training or just debugging
-        self.small_test_run = train_config['small_test_run']
+        self.small_test_run = train_config.get('small_test_run', False)
 
         # logging
         self.logging_freq = train_config.get("logging_freq", 100)
@@ -82,9 +85,11 @@ class TrainManager:
         self._log_parameters_list()
 
         # objective
+        self.utility_regularising = train_config.get("utility_regularising", False)
         self.label_smoothing = train_config.get("label_smoothing", 0.0)
         self.model.loss_function = XentLoss(pad_index=self.model.pad_index,
-                                            smoothing=self.label_smoothing)
+                                            smoothing=self.label_smoothing,
+                                            utility_regularising=self.utility_regularising)
         self.normalization = train_config.get("normalization", "batch")
         if self.normalization not in ["batch", "tokens", "none"]:
             raise ConfigurationError("Invalid normalization option."
@@ -113,6 +118,7 @@ class TrainManager:
         self.early_stopping_metric = train_config.get("early_stopping_metric",
                                                       "eval_metric")
         self.track_mbr = train_config.get("track_mbr", False)
+        self.utility_type = train_config.get("utility", "editdistance")
 
         # early_stopping_metric decides on how to find the early stopping point:
         # ckpts are written when there's a new high/low score for this metric.
@@ -445,6 +451,7 @@ class TrainManager:
                 # create a Batch object from torchtext batch
                 batch = self.batch_class(batch, self.model.pad_index,
                                          use_cuda=self.use_cuda)
+                # print(batch.src.shape, batch.src_length)
 
                 # get batch loss
                 batch_loss += self._train_step(batch)
@@ -536,9 +543,10 @@ class TrainManager:
         """
         # reactivate training
         self.model.train()
-
         # get loss
-        batch_loss, _, _, _ = self.model(return_type="loss", **vars(batch))
+        batch_loss, _, _, _ = self.model(return_type="loss",
+                                         **{"batch": batch, "utility_regularising": self.utility_regularising,
+                                            **vars(batch)})
 
         # sum multi-gpu losses
         if self.n_gpu > 1:
@@ -580,7 +588,7 @@ class TrainManager:
         logger.info(f"Validation by {'mbr' if track_mbr else 'greedy'} decoding")
         valid_score, valid_loss, valid_ppl, valid_sources, \
         valid_sources_raw, valid_references, valid_hypotheses, \
-        valid_hypotheses_raw, valid_attention_scores = \
+        valid_hypotheses_raw, valid_attention_scores, utility = \
             validate_on_data(
                 batch_size=self.eval_batch_size,
                 batch_class=self.batch_class,
@@ -597,7 +605,8 @@ class TrainManager:
                 sacrebleu=self.sacrebleu,  # sacrebleu options
                 n_gpu=self.n_gpu,
                 small_test_run=self.small_test_run,
-                mbr=True if track_mbr else False
+                mbr=True if track_mbr else False,
+                utility_type=self.utility_type
             )
 
         self.tb_writer.add_scalar("valid/valid_loss", valid_loss,
@@ -637,6 +646,7 @@ class TrainManager:
                          valid_ppl=valid_ppl,
                          eval_metric=self.eval_metric,
                          new_best=new_best,
+                         utility=utility,
                          mbr=track_mbr)
         if not self.small_test_run:
             self._log_examples(sources_raw=[v for v in valid_sources_raw],
@@ -674,8 +684,9 @@ class TrainManager:
                     valid_ppl: float,
                     valid_loss: float,
                     eval_metric: str,
+                    utility: float = 0,
                     new_best: bool = False,
-                    mbr: bool =False) -> None:
+                    mbr: bool = False) -> None:
         """
         Append a one-line report to validation logging file.
 
@@ -696,10 +707,11 @@ class TrainManager:
         with open(self.valid_report_file, 'a') as opened_file:
             opened_file.write(
                 "Steps: {}\tLoss: {:.5f}\tPPL: {:.5f}\t{}: {:.5f}\t"
-                "LR: {:.8f}\t{}\t{}\n".format(self.stats.steps, valid_loss,
-                                              valid_ppl, eval_metric, valid_score,
-                                              current_lr, "*" if new_best else "",
-                                              "mbr" if mbr else "greedy"))
+                "Utility {}:{:.5f}\tLR: {:.8f}\t{}\t{}\n".format(self.stats.steps, valid_loss,
+                                                                 valid_ppl, eval_metric, valid_score,
+                                                                 self.utility_type, utility,
+                                                                 current_lr, "*" if new_best else "",
+                                                                 "mbr" if mbr else "greedy"))
 
     def _log_parameters_list(self) -> None:
         """

@@ -49,7 +49,8 @@ def validate_on_data(model: Model, data: Dataset,
                      mbr_type: str = 'editdistance',
                      small_test_run: bool = False,
                      num_samples: int = 10,
-                     save_utility_per_sentence: bool = False) \
+                     save_utility_per_sentence: bool = False,
+                     utility_type=None) \
         -> (float, float, float, List[str], List[List[str]], List[str],
             List[str], List[List[str]], List[np.array]):
     """
@@ -129,7 +130,7 @@ def validate_on_data(model: Model, data: Dataset,
 
             # run as during training with teacher forcing
             if compute_loss and batch.trg is not None:
-                batch_loss, _, _, _ = model(return_type="loss", **vars(batch))
+                batch_loss, _, _, _ = model(return_type="loss", **{"batch": batch, **vars(batch)})
                 if n_gpu > 1:
                     batch_loss = batch_loss.mean()  # average on multi-gpu
                 total_loss += batch_loss
@@ -143,15 +144,16 @@ def validate_on_data(model: Model, data: Dataset,
                     beam_alpha=beam_alpha, max_output_length=max_output_length, sample=sample)
             else:
                 output = mbr_decoding(model=model, batch=batch, max_output_length=max_output_length,
-                                      num_samples=num_samples,
-                                      mbr_type=mbr_type)
+                                      compute_log_probs=False, need_grad=False, return_types=["h"],
+                                      num_samples=num_samples, mbr_type=mbr_type)[0]
                 attention_scores = None
 
             # sort outputs back to original order
             all_outputs.extend(output[sort_reverse_index])
+
             valid_attention_scores.extend(
                 attention_scores[sort_reverse_index]
-                if attention_scores is not None else [])
+                if attention_scores is not None and type(attention_scores) != int else [])
 
         assert len(all_outputs) == len(data)
 
@@ -205,8 +207,16 @@ def validate_on_data(model: Model, data: Dataset,
             elif eval_metric.lower() == 'meteor':
                 current_valid_score = meteor_utility(
                     valid_hypotheses, valid_references)
+            # compute utility
+            if utility_type is not None:
+                if utility_type == "editdistance":
+                    import editdistance
+                    utility = editdistance.eval(' '.join(valid_hypotheses), ' '.join(valid_references))
+
         else:
             current_valid_score = -1
+            utility = 0
+
         # saves utility per sentence. Not implemented yet
         # todo implement. ask Wilker more about utility
         if save_utility_per_sentence:
@@ -214,7 +224,7 @@ def validate_on_data(model: Model, data: Dataset,
 
     return current_valid_score, valid_loss, valid_ppl, valid_sources, \
            valid_sources_raw, valid_references, valid_hypotheses, \
-           decoded_valid, valid_attention_scores
+           decoded_valid, valid_attention_scores, utility
 
 
 def parse_test_args(cfg, mode="test"):
@@ -270,6 +280,7 @@ def parse_test_args(cfg, mode="test"):
         small_test_run = cfg["testing"].get("small_test_run", False)
         num_samples = cfg["testing"].get("num_samples", 10)
         mbr_type = cfg["testing"].get("mbr_type", 'editdistance')
+        utility_type = cfg["testing"].get("utility", 'editdistance')
 
     else:
         beam_size = 1
@@ -282,6 +293,7 @@ def parse_test_args(cfg, mode="test"):
         small_test_run = False
         num_samples = 1
         mbr_type = 'editdistance'
+        utility_type = None
 
     mbr_text, empty = f"{mbr_type}_MBR_", ""
     decoding_description = f"{'Greedy decoding' if (not sample and not mbr) else f'{mbr_text if mbr else empty}Sample decoding'}" if beam_size < 2 else \
@@ -294,7 +306,7 @@ def parse_test_args(cfg, mode="test"):
     return batch_size, batch_type, use_cuda, device, n_gpu, level, \
            eval_metric, max_output_length, beam_size, beam_alpha, \
            postprocess, bpe_type, sacrebleu, decoding_description, \
-           tokenizer_info, sample, mbr, mbr_type, small_test_run, num_samples
+           tokenizer_info, sample, mbr, mbr_type, small_test_run, num_samples, utility_type
 
 
 # pylint: disable-msg=logging-too-many-args
@@ -344,7 +356,8 @@ def test(cfg_file,
     # parse test args
     batch_size, batch_type, use_cuda, device, n_gpu, level, eval_metric, \
     max_output_length, beam_size, beam_alpha, postprocess, \
-    bpe_type, sacrebleu, decoding_description, tokenizer_info, sample, mbr, mbr_type, small_test_run, num_samples \
+    bpe_type, sacrebleu, decoding_description, tokenizer_info, \
+    sample, mbr, mbr_type, small_test_run, num_samples, utility_type \
         = parse_test_args(cfg, mode="test")
 
     # load model state from disk
@@ -370,7 +383,7 @@ def test(cfg_file,
 
         # pylint: disable=unused-variable
         score, loss, ppl, sources, sources_raw, references, hypotheses, \
-        hypotheses_raw, attention_scores = validate_on_data(
+        hypotheses_raw, attention_scores, utility = validate_on_data(
             model, data=data_set, batch_size=batch_size,
             batch_class=batch_class, batch_type=batch_type, level=level,
             max_output_length=max_output_length, eval_metric=eval_metric,
@@ -378,7 +391,7 @@ def test(cfg_file,
             beam_alpha=beam_alpha, postprocess=postprocess,
             bpe_type=bpe_type, sacrebleu=sacrebleu, n_gpu=n_gpu, sample=sample, mbr=mbr,
             small_test_run=small_test_run, num_samples=num_samples, mbr_type=mbr_type,
-            save_utility_per_sentence=save_utility_per_sentence)
+            save_utility_per_sentence=save_utility_per_sentence, utility_type=utility_type)
         # pylint: enable=unused-variable
 
         if "trg" in data_set.fields:
@@ -454,7 +467,7 @@ def translate(cfg_file: str,
         """ Translates given dataset, using parameters from outer scope. """
         # pylint: disable=unused-variable
         score, loss, ppl, sources, sources_raw, references, hypotheses, \
-        hypotheses_raw, attention_scores = validate_on_data(
+        hypotheses_raw, attention_scores, utility = validate_on_data(
             model, data=test_data, batch_size=batch_size,
             batch_class=batch_class, batch_type=batch_type, level=level,
             max_output_length=max_output_length, eval_metric="",
@@ -498,7 +511,7 @@ def translate(cfg_file: str,
     batch_size, batch_type, use_cuda, device, n_gpu, level, _, \
     max_output_length, beam_size, beam_alpha, postprocess, \
     bpe_type, sacrebleu, _, _, sample, mbr, mbr_type, small_test_run, \
-    num_samples = parse_test_args(cfg, mode="translate")
+    num_samples, utility_type = parse_test_args(cfg, mode="translate")
 
     # load model state from disk
     model_checkpoint = load_checkpoint(ckpt, use_cuda=use_cuda)
@@ -555,11 +568,21 @@ def meteor_utility(candidate, sample):
     return utility_fn(hyp=candidate, ref=sample)
 
 
-def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="editdistance"):
+def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="editdistance", return_types=("h",),
+                 need_grad=False, compute_log_probs=False, encoded_batch=None):
+    set_of_possible_returns = {"h", "samples", "utilities", "log_probabilities"}
+    assert len(set(return_types) - set_of_possible_returns) == 0, f"You have specified wrong return types. " \
+                                                                  f"Make sure it's one (or more) out of {set_of_possible_returns}"
     # sample S samples of translation y|x  using  run_batch
-    samples = [run_batch(model, batch, max_output_length=max_output_length, beam_size=1, beam_alpha=1, sample=True)[0]
-               for sample in
-               range(num_samples)]
+    samples_and_log_probs = [
+        run_batch(model, batch, max_output_length=max_output_length, beam_size=1, beam_alpha=1, sample=True,
+                  need_grad=need_grad, compute_log_probs=compute_log_probs, encoded_batch=encoded_batch)
+        for _ in range(num_samples)]
+    # decouple
+    samples, log_probs = list(list(zip(*samples_and_log_probs)))
+    if "log_probabilities" in return_types:
+        log_probs = torch.stack(log_probs)
+
     if mbr_type == "editdistance":
         import editdistance
         # define utility function
@@ -572,7 +595,7 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
         # transform the samples to form of list of of strings #
         decoded_samples = [" ".join([" ".join(batch) for batch in sample]) for sample in decoded_samples]
         # initialise utility matrix
-        U = torch.zeros([num_samples, num_samples], dtype=torch.float)
+        U = torch.zeros([num_samples, num_samples], dtype=torch.float)+1e-10
         # combination of all samples (since utility is symmetrical, we need only AB and not BA samples)
         combinations_of_samples = itertools.combinations(decoded_samples, r=2)
         # computing utility of the samples
@@ -583,20 +606,25 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
         # setting the values to the matrix
         U[tril_indices[0], tril_indices[1]] = utilities
         U[triu_indices[0], triu_indices[1]] = utilities
-        # go through all samples
-        # for i, sample_i in enumerate(decoded_samples):
-        #     for j, sample_j in enumerate(decoded_samples):
-        #         if i == j:
-        #             continue
-        #         else:
-        #             U[i, j] = utility_fn(sample_i, sample_j)
         # compute utility per candidate
         expected_uility = torch.mean(U, dim=1)
         # get argmin_c of sum^S u(samples, c) (min because we want less edit distance)
         best_idx = torch.argmin(expected_uility)
         prediction = samples[best_idx]
+        # return things that you want to return
+        return_list = []
+        if "h" in return_types:
+            return_list.append(prediction)
+        if "samples" in return_types:
+            return_list.append(samples)
+        if "utilities" in return_types:
+            return_list.append(U[best_idx])
+        if "log_probabilities" in return_types:
+            return_list.append(log_probs)
 
-        return prediction
+        return return_list
+
+
     else:
         from mbr_nmt import mbr, utility
         utility_fn = utility.parse_utility('meteor', 'en')
@@ -622,7 +650,6 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
         print(samples[0].shape)
         print(string_samples)
         print(len(string_samples), len(string_samples[0]), len(string_samples[0][0]))
-
         # string_samples = list(map(lambda sample: list(map(lambda batch: ''.join(list(map(str,batch))) , sample.tolist()) ),big_l))
         prediction_idx, prediction = mbr.mbr(string_samples, utility_fn)
         return prediction

@@ -19,7 +19,8 @@ testing:
   small_test_run: True
   mbr: True
   mbr_type: "editdistance"
-  num_samples: 5
+  utility: "editdistance"
+  num_samples: 2
 
 training:
   random_seed: 42
@@ -45,14 +46,16 @@ training:
   overwrite: True
   shuffle: True
   use_cuda: False
-  max_output_length: 100
+  max_output_length: 10
   print_valid_sents: [ 0, 1, 2, 3, 4 ]
   save_latest_ckpt: True
   keep_last_ckpts: 5
 
   track_mbr: True
   mbr_type: "editdistance"
+  utility: "editdistance"
   small_test_run: True
+  utility_regularising: True
 model:
   initializer: "xavier"
   embed_initializer: "xavier"
@@ -61,6 +64,7 @@ model:
   bias_initializer: "zeros"
   tied_embeddings: True
   tied_softmax: True
+
   encoder:
     type: "transformer"
     num_layers: 1

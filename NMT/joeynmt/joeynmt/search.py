@@ -1,4 +1,6 @@
 # coding: utf-8
+from contextlib import nullcontext
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -14,7 +16,8 @@ __all__ = ["greedy", "transformer_greedy", "beam_search", "run_batch", "sample"]
 
 
 def greedy(src_mask: Tensor, max_output_length: int, model: Model,
-           encoder_output: Tensor, encoder_hidden: Tensor, sample: bool) \
+           encoder_output: Tensor, encoder_hidden: Tensor, sample: bool, need_grad=False,
+           compute_log_probs=True) \
         -> (np.array, np.array):
     """
     Greedy decoding. Select the token word highest probability at each time
@@ -39,12 +42,14 @@ def greedy(src_mask: Tensor, max_output_length: int, model: Model,
         greedy_fun = recurrent_greedy
 
     return greedy_fun(
-        src_mask, max_output_length, model, encoder_output, encoder_hidden, sample)
+        src_mask, max_output_length, model, encoder_output, encoder_hidden, sample, need_grad=need_grad,
+        compute_log_probs=compute_log_probs)
 
 
 def recurrent_greedy(
         src_mask: Tensor, max_output_length: int, model: Model,
-        encoder_output: Tensor, encoder_hidden: Tensor, sample: bool = False) -> (np.array, np.array):
+        encoder_output: Tensor, encoder_hidden: Tensor, sample: bool = False, need_grad=False,
+        compute_log_probs=False) -> (np.array, np.array):
     """
     Greedy decoding: in each step, choose the word that gets highest score.
     Version for recurrent decoder.
@@ -106,7 +111,8 @@ def recurrent_greedy(
 # pylint: disable=unused-argument
 def transformer_greedy(
         src_mask: Tensor, max_output_length: int, model: Model,
-        encoder_output: Tensor, encoder_hidden: Tensor, sample: bool = False) -> (np.array, None):
+        encoder_output: Tensor, encoder_hidden: Tensor, sample: bool = False,
+        need_grad: bool = False, compute_log_probs: bool = False) -> (np.array, None):
     """
     Special greedy function for transformer, since it works differently.
     The transformer remembers all previous states and attends to them.
@@ -126,7 +132,7 @@ def transformer_greedy(
 
     # start with BOS-symbol for each sentence in the batch
     ys = encoder_output.new_full([batch_size, 1], bos_index, dtype=torch.long)
-
+    log_prob_of_sentence = 0
     # a subsequent mask is intersected with this in decoder forward pass
     trg_mask = src_mask.new_ones([1, 1, 1])
     if isinstance(model, torch.nn.DataParallel):
@@ -135,9 +141,11 @@ def transformer_greedy(
 
     finished = src_mask.new_zeros(batch_size).byte()
 
+    # context for passing gradients. If need_grad, gradients will be stored, otherwise no_grad() context
+    gradient_context = nullcontext() if need_grad else torch.no_grad()
     for _ in range(max_output_length):
         # pylint: disable=unused-variable
-        with torch.no_grad():
+        with gradient_context:
             logits, _, _, _ = model(
                 return_type="decode",
                 trg_input=ys,  # model.trg_embed(ys) # embed the previous tokens
@@ -148,17 +156,23 @@ def transformer_greedy(
                 decoder_hidden=None,
                 trg_mask=trg_mask
             )
-
             logits = logits[:, -1]
-
+            # greedy decoding
             if not sample:
                 _, next_word = torch.max(logits, dim=1)
+            # sampling
             else:
                 py_x = Categorical(logits=logits)
                 next_word = py_x.sample()
             next_word = next_word.data
             ys = torch.cat([ys, next_word.unsqueeze(-1)], dim=1)
-
+            if compute_log_probs:
+                # transform logits into log probs
+                log_probs = F.log_softmax(logits, dim=-1)[0]
+                # get the log p(y|...)
+                log_prob_of_word = log_probs[next_word]
+                # add to the sentence log_probability
+                log_prob_of_sentence += log_prob_of_word
         # check if previous symbol was <eos>
         is_eos = torch.eq(next_word, eos_index)
         finished += is_eos
@@ -167,7 +181,7 @@ def transformer_greedy(
             break
 
     ys = ys[:, 1:]  # remove BOS-symbol
-    return ys.detach().cpu().numpy(), None
+    return ys.detach().cpu().numpy(), log_prob_of_sentence
 
 
 # pylint: disable=too-many-statements,too-many-branches
@@ -425,7 +439,8 @@ def beam_search(model: Model, size: int,
 
 
 def run_batch(model: Model, batch: Batch, max_output_length: int,
-              beam_size: int, beam_alpha: float, sample=False) -> (np.array, np.array):
+              beam_size: int, beam_alpha: float, sample=False, need_grad=False,
+              compute_log_probs=False, encoded_batch=None) -> (np.array, np.array):
     """
     Get outputs and attentions scores for a given batch
 
@@ -434,13 +449,17 @@ def run_batch(model: Model, batch: Batch, max_output_length: int,
     :param max_output_length: maximum length of hypotheses
     :param beam_size: size of the beam for beam search, if 0 use greedy
     :param beam_alpha: alpha value for beam search
+    :param sample: if True, will sample non-greedily
     :return: stacked_output: hypotheses for batch,
         stacked_attention_scores: attention scores for batch
     """
-    with torch.no_grad():
-        encoder_output, encoder_hidden, _, _ = model(
-            return_type="encode", **vars(batch))
-
+    if encoded_batch is not None:
+        encoder_output, encoder_hidden = encoded_batch
+    else:
+        gradient_context = nullcontext() if need_grad else torch.no_grad()
+        with gradient_context:
+            encoder_output, encoder_hidden, _, _ = model(
+                return_type="encode", **vars(batch))
     # if maximum output length is not globally specified, adapt to src len
     if max_output_length is None:
         max_output_length = int(max(batch.src_length.cpu().numpy()) * 1.5)
@@ -451,7 +470,8 @@ def run_batch(model: Model, batch: Batch, max_output_length: int,
             max_output_length=max_output_length,
             model=model,
             encoder_output=encoder_output,
-            encoder_hidden=encoder_hidden, sample=sample)
+            encoder_hidden=encoder_hidden, sample=sample, need_grad=need_grad,
+            compute_log_probs=compute_log_probs)
         # batch, time, max_src_length
     else:  # beam search
         stacked_output, stacked_attention_scores = beam_search(

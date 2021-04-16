@@ -33,4 +33,4 @@ pip install --user --editable .
 
 
 # Run your code
-srun python -m joeynmt train models/iwslt14_deen_bpe_transformer/config.yaml
+srun python -m joeynmt train ../models/iwslt14_deen_bpe_transformer/config.yaml

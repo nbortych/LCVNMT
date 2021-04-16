@@ -5,6 +5,7 @@ Module to represents whole models
 from typing import Callable
 import logging
 
+import torch
 import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
@@ -53,7 +54,7 @@ class Model(nn.Module):
         self.bos_index = self.trg_vocab.stoi[BOS_TOKEN]
         self.pad_index = self.trg_vocab.stoi[PAD_TOKEN]
         self.eos_index = self.trg_vocab.stoi[EOS_TOKEN]
-        self._loss_function = None # set by the TrainManager
+        self._loss_function = None  # set by the TrainManager
 
     @property
     def loss_function(self):
@@ -74,6 +75,8 @@ class Model(nn.Module):
 
         :param return_type: one of {"loss", "encode", "decode"}
         """
+        print(f"Running model with {return_type}")
+
         if return_type is None:
             raise ValueError("Please specify return_type: "
                              "{`loss`, `encode`, `decode`}.")
@@ -81,14 +84,33 @@ class Model(nn.Module):
         return_tuple = (None, None, None, None)
         if return_type == "loss":
             assert self.loss_function is not None
-
-            out, _, _, _ = self._encode_decode(**kwargs)
+            # out, hidden, _, _ = self._encode_decode(**kwargs)
+            # encode and decode explicitly to save encoded for sampling
+            encoder_output, encoder_hidden = self._encode(**kwargs)
+            unroll_steps = kwargs['trg_input'].size(1)
+            out, hidden, _, _ = self._decode(encoder_output=encoder_output, encoder_hidden=encoder_hidden,
+                                             unroll_steps=unroll_steps, **kwargs)
 
             # compute log probs
             log_probs = F.log_softmax(out, dim=-1)
-
             # compute batch loss
             batch_loss = self.loss_function(log_probs, kwargs["trg"])
+            utility_reg = kwargs.get("utility_regularising", False)  # self.loss_function.utility_regularising
+            if utility_reg:
+                # reinforce: \delta E = E_{p(y|\theta, x)} [log u(y,h) * \delta log p (y|\theta, x)]
+                from joeynmt.prediction import mbr_decoding
+                # compute mbr, get utility(samples, h)
+                u_h, sample_log_probs = mbr_decoding(self, kwargs["batch"], max_output_length=5, num_samples=2,
+                                                     mbr_type="editdistance",
+                                                     return_types=("utilities", "log_probabilities"),
+                                                     need_grad=True, compute_log_probs=True,
+                                                     encoded_batch=(encoder_output, encoder_hidden))
+                # get log_u(samples,h) and detach for reinforce
+                log_uh = torch.log(u_h).detach()
+
+                utility_term = torch.mean(log_uh * sample_log_probs)
+                batch_loss += utility_term
+
 
             # return batch loss
             #     = sum over all elements in batch that are not pad
@@ -194,6 +216,7 @@ class Model(nn.Module):
 
 class _DataParallel(nn.DataParallel):
     """ DataParallel wrapper to pass through the model attributes """
+
     def __getattr__(self, name):
         try:
             return super().__getattr__(name)
@@ -240,7 +263,7 @@ def build_model(cfg: dict = None,
     if cfg["encoder"].get("type", "recurrent") == "transformer":
         assert cfg["encoder"]["embeddings"]["embedding_dim"] == \
                cfg["encoder"]["hidden_size"], \
-               "for transformer, emb_size must be hidden_size"
+            "for transformer, emb_size must be hidden_size"
 
         encoder = TransformerEncoder(**cfg["encoder"],
                                      emb_size=src_embed.embedding_dim,
