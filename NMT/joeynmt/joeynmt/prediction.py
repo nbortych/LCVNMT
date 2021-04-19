@@ -7,6 +7,7 @@ import sys
 from typing import List, Optional
 import logging
 import itertools
+import time
 
 import numpy as np
 import torch
@@ -328,7 +329,7 @@ def test(cfg_file,
     :param datasets: datasets to predict
     :param save_attention: whether to save the computed attention weights
     """
-
+    test_start_time = time.time()
     cfg = load_config(cfg_file)
     model_dir = cfg["training"]["model_dir"]
 
@@ -425,6 +426,9 @@ def test(cfg_file,
                 for hyp in hypotheses:
                     out_file.write(hyp + "\n")
             logger.info("Translations saved to: %s", output_path_set)
+        test_duration = time.time() - test_start_time
+        logger.info(f"Test duration was {test_duration:4f}")
+
 
 
 def translate(cfg_file: str,
@@ -578,8 +582,10 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
         run_batch(model, batch, max_output_length=max_output_length, beam_size=1, beam_alpha=1, sample=True,
                   need_grad=need_grad, compute_log_probs=compute_log_probs, encoded_batch=encoded_batch)
         for _ in range(num_samples)]
+
     # decouple
     samples, log_probs = list(list(zip(*samples_and_log_probs)))
+
     if "log_probabilities" in return_types:
         log_probs = torch.stack(log_probs)
 
