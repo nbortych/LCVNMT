@@ -104,6 +104,9 @@ class TrainManager:
                                          parameters=model.parameters())
 
         # validation & early stopping
+        self.track_mbr = train_config.get("track_mbr", False)
+        self.utility_type = train_config.get("utility", "editdistance")
+
         self.validation_freq = train_config.get("validation_freq", 1000)
         self.log_valid_sents = train_config.get("print_valid_sents", [0, 1, 2])
         self.ckpt_queue = collections.deque(
@@ -117,8 +120,6 @@ class TrainManager:
                                      "'token_accuracy', 'sequence_accuracy'.")
         self.early_stopping_metric = train_config.get("early_stopping_metric",
                                                       "eval_metric")
-        self.track_mbr = train_config.get("track_mbr", False)
-        self.utility_type = train_config.get("utility", "editdistance")
 
         # early_stopping_metric decides on how to find the early stopping point:
         # ckpts are written when there's a new high/low score for this metric.

@@ -75,7 +75,7 @@ class Model(nn.Module):
 
         :param return_type: one of {"loss", "encode", "decode"}
         """
-        print(f"Running model with {return_type}")
+        # print(f"Running model with {return_type}")
 
         if return_type is None:
             raise ValueError("Please specify return_type: "
@@ -106,7 +106,7 @@ class Model(nn.Module):
                                                      need_grad=True, compute_log_probs=True,
                                                      encoded_batch=(encoder_output, encoder_hidden))
                 # get log_u(samples,h) and detach for reinforce
-                log_uh = torch.log(u_h).detach()
+                log_uh = torch.log(u_h).detach().to(sample_log_probs.device)
 
                 utility_term = torch.mean(log_uh * sample_log_probs)
                 batch_loss += utility_term
