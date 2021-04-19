@@ -1,11 +1,11 @@
 #!/bin/bash
 
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:4
 #SBATCH --job-name=Joey_Baseline
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=3
-#SBATCH --time=00:06:00
+#SBATCH --time=00:10:00
 #SBATCH --mem=32000M
 #SBATCH --output=../slurm/slurm_output_%A_training_test.out
 
@@ -17,9 +17,9 @@ module load cuDNN/7.6.5.32-CUDA-10.1.243
 module load NCCL/2.5.6-CUDA-10.1.243
 module load Anaconda3/2018.12
 
-# pip install --user --upgrade pip
+pip install --user --upgrade pip
 
-cd ..
+
 
 # Your job starts in the directory where you call sbatch
 cd $HOME/joeynmt
@@ -31,6 +31,6 @@ pip install --user --editable .
 # source activate ...
 # Install things
 
-
+cd ..
 # Run your code
 srun python -m joeynmt train configs/transformer_iwslt14_deen_bpe_small_utility.yaml
