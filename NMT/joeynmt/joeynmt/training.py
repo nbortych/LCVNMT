@@ -87,7 +87,12 @@ class TrainManager:
 
         # objective
         self.utility_regularising = train_config.get("utility_regularising", False)
+        self.utility_alpha = train_config.get("utility_alpha", 1)
         self.label_smoothing = train_config.get("label_smoothing", 0.0)
+        self.num_samples = train_config.get("num_samples", 10)
+
+        self.model._utility_alpha = self.utility_alpha
+        self.model._num_samples = self.num_samples
         self.model.loss_function = XentLoss(pad_index=self.model.pad_index,
                                             smoothing=self.label_smoothing,
                                             utility_regularising=self.utility_regularising)
@@ -183,6 +188,7 @@ class TrainManager:
 
         # generation
         self.max_output_length = train_config.get("max_output_length", None)
+        self.model._max_output_length = self.max_output_length
 
         # CPU / GPU
         self.use_cuda = train_config["use_cuda"] and torch.cuda.is_available()
@@ -496,7 +502,7 @@ class TrainManager:
                                                                elapsed_tokens / elapsed,
                             self.optimizer.param_groups[0]["lr"])
 
-                        epoch_duration+=elapsed
+                        epoch_duration += elapsed
                         start = time.time()
                         total_valid_duration = 0
                         start_tokens = self.stats.total_tokens

@@ -55,6 +55,9 @@ class Model(nn.Module):
         self.pad_index = self.trg_vocab.stoi[PAD_TOKEN]
         self.eos_index = self.trg_vocab.stoi[EOS_TOKEN]
         self._loss_function = None  # set by the TrainManager
+        self._utility_alpha = 1  # set by the TrainManager
+        self._num_samples = 10  # set by the TrainManager
+        self._max_output_length = None  # set by the TrainManager
 
     @property
     def loss_function(self):
@@ -101,7 +104,8 @@ class Model(nn.Module):
                 # reinforce: \delta E = E_{p(y|\theta, x)} [log u(y,h) * \delta log p (y|\theta, x)]
                 from joeynmt.prediction import mbr_decoding
                 # compute mbr, get utility(samples, h)
-                u_h, sample_log_probs = mbr_decoding(self, kwargs["batch"], max_output_length=10, num_samples=3,
+                u_h, sample_log_probs = mbr_decoding(self, kwargs["batch"], max_output_length=self._max_output_length,
+                                                     num_samples=self._num_samples,
                                                      mbr_type="editdistance",
                                                      return_types=("utilities", "log_probabilities"),
                                                      need_grad=True, compute_log_probs=True,
@@ -110,14 +114,14 @@ class Model(nn.Module):
                 log_uh = torch.log(u_h).detach().to(sample_log_probs.device)
                 utility_term = torch.mean(log_uh * sample_log_probs)
                 if torch.isinf(utility_term).any():
-                    logger.info("INF UTILITY")
+                    logger.info("INF UTILITY" * 100)
                     logger.info(f"log_uh is inf? {torch.isinf(log_uh).any()}")
                     logger.info(f"sample_log_probs is inf? {torch.isinf(sample_log_probs).any()}")
 
                 if torch.isinf(batch_loss).any():
                     logger.info("INF batch loss")
-                batch_loss += utility_term
-
+                # logger.info(f"Batch loss {batch_loss}, Utility term {utility_term}")
+                batch_loss += utility_term * self._utility_alpha
 
             # return batch loss
             #     = sum over all elements in batch that are not pad

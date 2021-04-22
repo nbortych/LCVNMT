@@ -192,7 +192,6 @@ def validate_on_data(model: Model, data: Dataset,
             assert len(valid_hypotheses) == len(valid_references)
 
             current_valid_score = 0
-            logger.info(f"{len(valid_references), len(valid_hypotheses)}")
             if eval_metric.lower() == 'bleu':
                 # this version does not use any tokenization
                 current_valid_score = bleu(
@@ -709,8 +708,6 @@ if __name__ == "__main__":
     #                                                                           cut_at_eos=True)] for sample in samples]
     #     # print(decoded_samples[0])
     #
-    #     # todo check that the following code works
-    #     # todo do utility on sentences, instead of on whole samples (so evidence for SxBxL)
     #     # initialise utility matrix
     #     U = torch.zeros([num_samples, num_samples], dtype=torch.float) + 1e-10
     #     # combination of all samples (since utility is symmetrical, we need only AB and not BA samples)

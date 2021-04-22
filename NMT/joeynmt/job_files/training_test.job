@@ -31,6 +31,6 @@ pip install --user --editable .
 # source activate ...
 # Install things
 
-
+# export CUDA_LAUNCH_BLOCKING=1
 # Run your code
 srun python -m joeynmt train configs/transformer_iwslt14_deen_bpe_small_utility.yaml #
