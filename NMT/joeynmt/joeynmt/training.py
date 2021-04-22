@@ -72,6 +72,7 @@ class TrainManager:
 
         # are we really training or just debugging
         self.small_test_run = train_config.get('small_test_run', False)
+        logger.info(f"Small test run? {self.small_test_run}")
 
         # logging
         self.logging_freq = train_config.get("logging_freq", 100)
@@ -442,6 +443,7 @@ class TrainManager:
 
             # Reset statistics for each epoch.
             start = time.time()
+            epoch_duration = 0
             total_valid_duration = 0
             start_tokens = self.stats.total_tokens
             self.model.zero_grad()
@@ -493,6 +495,8 @@ class TrainManager:
                             self.stats.steps, batch_loss,
                                                                elapsed_tokens / elapsed,
                             self.optimizer.param_groups[0]["lr"])
+
+                        epoch_duration+=elapsed
                         start = time.time()
                         total_valid_duration = 0
                         start_tokens = self.stats.total_tokens
@@ -511,9 +515,12 @@ class TrainManager:
 
                 if self.stats.stop:
                     break
-            # validate at the end of epoch
+
+            else:
+                epoch_duration = time.time() - start - total_valid_duration + epoch_duration
+                logger.info(f"End of epoch {epoch_no + 1}, it took {epoch_duration:.3f}. Epoch loss is {epoch_loss}")
+            # validate at the end of epoch if small
             if self.small_test_run:
-                logger.info(f"End of epoch {epoch_no + 1}")
                 valid_duration = self._validate(valid_data, epoch_no)
                 if self.track_mbr:
                     mbr_valid_duration = self._validate(valid_data, epoch_no, True)
@@ -525,8 +532,8 @@ class TrainManager:
                             self.learning_rate_min)
                 break
 
-            logger.info('Epoch %3d: total training loss %.2f', epoch_no + 1,
-                        epoch_loss)
+            # logger.info('Epoch %3d: total training loss %.2f', epoch_no + 1,
+            #             epoch_loss)
         else:
             logger.info('Training ended after %3d epochs.', epoch_no + 1)
         logger.info('Best validation result (greedy) at step %8d: %6.2f %s.',

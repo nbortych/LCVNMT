@@ -84,6 +84,7 @@ class Model(nn.Module):
         return_tuple = (None, None, None, None)
         if return_type == "loss":
             assert self.loss_function is not None
+            # logger.info(f"Batch shape {kwargs['src'].shape}, src mask {kwargs['src_mask'].shape}, src length {kwargs['src_length']}")
             # out, hidden, _, _ = self._encode_decode(**kwargs)
             # encode and decode explicitly to save encoded for sampling
             encoder_output, encoder_hidden = self._encode(**kwargs)
@@ -100,15 +101,21 @@ class Model(nn.Module):
                 # reinforce: \delta E = E_{p(y|\theta, x)} [log u(y,h) * \delta log p (y|\theta, x)]
                 from joeynmt.prediction import mbr_decoding
                 # compute mbr, get utility(samples, h)
-                u_h, sample_log_probs = mbr_decoding(self, kwargs["batch"], max_output_length=5, num_samples=2,
+                u_h, sample_log_probs = mbr_decoding(self, kwargs["batch"], max_output_length=10, num_samples=3,
                                                      mbr_type="editdistance",
                                                      return_types=("utilities", "log_probabilities"),
                                                      need_grad=True, compute_log_probs=True,
-                                                     encoded_batch=(encoder_output, encoder_hidden))
+                                                     encoded_batch=None)
                 # get log_u(samples,h) and detach for reinforce
                 log_uh = torch.log(u_h).detach().to(sample_log_probs.device)
-
                 utility_term = torch.mean(log_uh * sample_log_probs)
+                if torch.isinf(utility_term).any():
+                    logger.info("INF UTILITY")
+                    logger.info(f"log_uh is inf? {torch.isinf(log_uh).any()}")
+                    logger.info(f"sample_log_probs is inf? {torch.isinf(sample_log_probs).any()}")
+
+                if torch.isinf(batch_loss).any():
+                    logger.info("INF batch loss")
                 batch_loss += utility_term
 
 

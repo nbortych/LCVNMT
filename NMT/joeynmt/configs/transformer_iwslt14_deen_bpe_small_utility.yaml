@@ -15,12 +15,11 @@ data:
 testing:
   beam_size: 1
   alpha: 1.0
-
   small_test_run: True
   mbr: True
   mbr_type: "editdistance"
   utility: "editdistance"
-  num_samples: 2
+  num_samples: 3
 
 training:
   random_seed: 42
@@ -38,7 +37,7 @@ training:
   batch_size: 256
   batch_type: "token"
   early_stopping_metric: "eval_metric"
-  epochs: 2
+  epochs: 1
   validation_freq: 1000
   logging_freq: 100
   eval_metric: "bleu"
@@ -54,7 +53,7 @@ training:
   track_mbr: True
   mbr_type: "editdistance"
   utility: "editdistance"
-  small_test_run: False
+  small_test_run: True
   utility_regularising: True
 model:
   initializer: "xavier"

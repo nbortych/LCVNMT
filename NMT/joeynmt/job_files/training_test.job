@@ -5,9 +5,9 @@
 #SBATCH --job-name=Joey_Baseline
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=3
-#SBATCH --time=00:06:00
-#SBATCH --mem=32000M
-#SBATCH --output=../slurm/slurm_output_%A_training_test.out
+#SBATCH --time=00:20:00
+#SBATCH --mem=64000M
+#SBATCH --output=../slurm/slurm_output_%A_training_test_single_gpu.out
 
 module purge
 module load 2019
@@ -33,4 +33,4 @@ pip install --user --editable .
 
 
 # Run your code
-srun python -m joeynmt train configs/transformer_iwslt14_deen_bpe_small_utility.yaml
+srun python -m joeynmt train configs/transformer_iwslt14_deen_bpe_small_utility.yaml #

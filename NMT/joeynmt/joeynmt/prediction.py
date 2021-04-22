@@ -8,6 +8,7 @@ from typing import List, Optional
 import logging
 import itertools
 import time
+import editdistance
 
 import numpy as np
 import torch
@@ -105,7 +106,7 @@ def validate_on_data(model: Model, data: Dataset,
     # if small test run, use subset of the data that is one batch
     if small_test_run:
         data, _ = data.split(0.0005)
-        print("The lenght of data is", len(data))
+        logger.info(f"The lenght of validation data for small test run is {len(data)}")
         # batch_size = len(data)
 
     valid_iter = make_data_iter(
@@ -191,6 +192,7 @@ def validate_on_data(model: Model, data: Dataset,
             assert len(valid_hypotheses) == len(valid_references)
 
             current_valid_score = 0
+            logger.info(f"{len(valid_references), len(valid_hypotheses)}")
             if eval_metric.lower() == 'bleu':
                 # this version does not use any tokenization
                 current_valid_score = bleu(
@@ -210,18 +212,17 @@ def validate_on_data(model: Model, data: Dataset,
                     valid_hypotheses, valid_references)
             # compute utility
             if utility_type is not None:
-                if utility_type == "editdistance":
-                    import editdistance
-                    utility = editdistance.eval(' '.join(valid_hypotheses), ' '.join(valid_references))
 
+                if utility_type == "editdistance":
+                    utility = edit_distance_utility(valid_hypotheses, valid_references, reduce_type="sum")
         else:
             current_valid_score = -1
             utility = 0
 
         # saves utility per sentence. Not implemented yet
         # todo implement. ask Wilker more about utility
-        if save_utility_per_sentence:
-            get_utility_per_sentence(eval_metric.lower(), valid_hypotheses, valid_references)
+        # if save_utility_per_sentence:
+        #     get_utility_per_sentence(eval_metric.lower(), valid_hypotheses, valid_references)
 
     return current_valid_score, valid_loss, valid_ppl, valid_sources, \
            valid_sources_raw, valid_references, valid_hypotheses, \
@@ -427,8 +428,7 @@ def test(cfg_file,
                     out_file.write(hyp + "\n")
             logger.info("Translations saved to: %s", output_path_set)
         test_duration = time.time() - test_start_time
-        logger.info(f"Test duration was {test_duration:4f}")
-
+        logger.info(f"Test duration was {test_duration:.2f}")
 
 
 def translate(cfg_file: str,
@@ -572,62 +572,86 @@ def meteor_utility(candidate, sample):
     return utility_fn(hyp=candidate, ref=sample)
 
 
+def edit_distance_utility(sample_1, sample_2, reduce_type="mean"):
+    """
+    Compute mean (by batch) or total edit distance utility between two samples shaped as BxL.
+    """
+    # iterate over batches in sample
+    total_utility = sum([editdistance.eval(batch_1, batch_2) for batch_1, batch_2 in zip(sample_1, sample_2)])
+    if reduce_type == "mean":
+        # compute mean sample utility
+        return total_utility / len(sample_1)
+    elif reduce_type == "sum":
+        return total_utility
+
+
 def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="editdistance", return_types=("h",),
                  need_grad=False, compute_log_probs=False, encoded_batch=None):
     set_of_possible_returns = {"h", "samples", "utilities", "log_probabilities"}
     assert len(set(return_types) - set_of_possible_returns) == 0, f"You have specified wrong return types. " \
                                                                   f"Make sure it's one (or more) out of {set_of_possible_returns}"
     # sample S samples of translation y|x  using  run_batch
-    samples_and_log_probs = [
-        run_batch(model, batch, max_output_length=max_output_length, beam_size=1, beam_alpha=1, sample=True,
-                  need_grad=need_grad, compute_log_probs=compute_log_probs, encoded_batch=encoded_batch)
-        for _ in range(num_samples)]
 
-    # decouple
-    samples, log_probs = list(list(zip(*samples_and_log_probs)))
+    # copy batch num_samples times to sample
+    batch_size = batch.src.shape[0]
+    batch.src = batch.src.repeat(num_samples, 1)
+    batch.src_mask = batch.src_mask.repeat(num_samples, 1, 1)
+    batch.trg_mask = batch.trg_mask.repeat(num_samples, 1, 1)
+    # [B*SxL, B*S]
+    samples, log_probs = run_batch(model, batch, max_output_length=max_output_length, beam_size=1, beam_alpha=1,
+                                   sample=True,
+                                   need_grad=need_grad, compute_log_probs=compute_log_probs,
+                                   encoded_batch=encoded_batch)
 
+    # [BxSxL]
+    samples = samples.reshape(batch_size, num_samples, -1)
+    # print("samples shape", samples.shape)
     if "log_probabilities" in return_types:
-        log_probs = torch.stack(log_probs)
+        # [BxS]
+        log_probs = log_probs.reshape(batch_size, num_samples)
+        # print("log prob shape", log_probs.shape)
 
     if mbr_type == "editdistance":
-        import editdistance
         # define utility function
         utility_fn = editdistance.eval
 
         # transform indices to str
-        decoded_samples = [model.trg_vocab.arrays_to_sentences(arrays=sample,
-                                                               cut_at_eos=True) for sample in samples]
-
-        # transform the samples to form of list of of strings #
-        decoded_samples = [" ".join([" ".join(batch) for batch in sample]) for sample in decoded_samples]
-        # initialise utility matrix
-        U = torch.zeros([num_samples, num_samples], dtype=torch.float)+1e-10
-        # combination of all samples (since utility is symmetrical, we need only AB and not BA samples)
-        combinations_of_samples = itertools.combinations(decoded_samples, r=2)
-        # computing utility of the samples
-        utilities = torch.tensor(list(itertools.starmap(utility_fn, combinations_of_samples))).to(torch.float)
+        decoded_samples = [
+            [' '.join(sample) for sample in model.trg_vocab.arrays_to_sentences(arrays=batch,
+                                                                                cut_at_eos=True)] for batch in samples]
+        # initialise utility matrix [BxSxS]
+        U = torch.zeros([batch_size, num_samples, num_samples], dtype=torch.float) + 1e-10
+        # combination of all samples (since utility is symmetrical, we need only AB and not BA samples) [BxC]
+        batch_combinations_of_samples = [itertools.combinations(batch_samples, r=2) for batch_samples in
+                                         decoded_samples]
+        # computing utility of the samples [BxS]
+        utilities = torch.tensor([list(itertools.starmap(utility_fn, combinations_of_samples)) for
+                                  combinations_of_samples in batch_combinations_of_samples]).to(torch.float)
         # lower triangular and upper indices of the matrix, below the diagonal, since distance(A,A) = 0
         tril_indices = torch.tril_indices(row=num_samples, col=num_samples, offset=-1)
         triu_indices = torch.triu_indices(row=num_samples, col=num_samples, offset=1)
-        # setting the values to the matrix
-        U[tril_indices[0], tril_indices[1]] = utilities
-        U[triu_indices[0], triu_indices[1]] = utilities
-        # compute utility per candidate
-        expected_uility = torch.mean(U, dim=1)
-        # get argmin_c of sum^S u(samples, c) (min because we want less edit distance)
-        best_idx = torch.argmin(expected_uility)
-        prediction = samples[best_idx]
+        # setting the values to the matrix [BxSxS]
+        U[:, tril_indices[0], tril_indices[1]] = utilities
+        U[:, triu_indices[0], triu_indices[1]] = utilities
+        # compute utility per candidate [BxS]
+        expected_uility = torch.mean(U, dim=-1)
+        # get argmin_c of sum^S u(samples, c) (min because we want less edit distance) [B]
+        best_idx = torch.argmin(expected_uility, dim=-1)
         # return things that you want to return
         return_list = []
         if "h" in return_types:
+            # get prediction with best samples
+            prediction = samples[np.arange(batch_size), best_idx.numpy()]
             return_list.append(prediction)
         if "samples" in return_types:
             return_list.append(samples)
         if "utilities" in return_types:
-            return_list.append(U[best_idx])
+            best_idx = best_idx.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, num_samples)
+            u_h = U.gather(1, best_idx).squeeze(-1)
+            u_h = u_h + 1e-10
+            return_list.append(u_h)
         if "log_probabilities" in return_types:
             return_list.append(log_probs)
-
         return return_list
 
 
@@ -667,4 +691,54 @@ def get_utility_per_sentence(utility, hyp_samples, ref_samples):
 
 
 if __name__ == "__main__":
-    print(0)
+    pass
+
+    # # SxBxL
+    # samples = samples.reshape(num_samples, batch_size, -1)
+    #
+    # # if "log_probabilities" in return_types:
+    # #     log_probs = torch.stack(log_probs)
+    #
+    # if mbr_type == "editdistance":
+    #     # define utility function
+    #     utility_fn = edit_distance_utility
+    #
+    #     # transform indices to str
+    #     decoded_samples = [
+    #         [' '.join(batch) for batch in model.trg_vocab.arrays_to_sentences(arrays=sample,
+    #                                                                           cut_at_eos=True)] for sample in samples]
+    #     # print(decoded_samples[0])
+    #
+    #     # todo check that the following code works
+    #     # todo do utility on sentences, instead of on whole samples (so evidence for SxBxL)
+    #     # initialise utility matrix
+    #     U = torch.zeros([num_samples, num_samples], dtype=torch.float) + 1e-10
+    #     # combination of all samples (since utility is symmetrical, we need only AB and not BA samples)
+    #     combinations_of_samples = itertools.combinations(decoded_samples, r=2)
+    #     # computing utility of the samples
+    #     utilities = torch.tensor(list(itertools.starmap(utility_fn, combinations_of_samples))).to(torch.float)
+    #     # lower triangular and upper indices of the matrix, below the diagonal, since distance(A,A) = 0
+    #     tril_indices = torch.tril_indices(row=num_samples, col=num_samples, offset=-1)
+    #     triu_indices = torch.triu_indices(row=num_samples, col=num_samples, offset=1)
+    #     # setting the values to the matrix
+    #     U[tril_indices[0], tril_indices[1]] = utilities
+    #     U[triu_indices[0], triu_indices[1]] = utilities
+    #     # compute utility per candidate
+    #     expected_uility = torch.mean(U, dim=1)
+    #     # print("utilities", utilities)
+    #     # print("U matrix", U)
+    #     # print("expected utility", expected_uility)
+    #     # get argmin_c of sum^S u(samples, c) (min because we want less edit distance)
+    #     best_idx = torch.argmin(expected_uility)
+    #     prediction = samples[best_idx]
+    #     # return things that you want to return
+    #     return_list = []
+    #     if "h" in return_types:
+    #         return_list.append(prediction)
+    #     if "samples" in return_types:
+    #         return_list.append(samples)
+    #     if "utilities" in return_types:
+    #         return_list.append(U[best_idx])
+    #     if "log_probabilities" in return_types:
+    #         return_list.append(log_probs)
+    #     return return_list

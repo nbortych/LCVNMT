@@ -17,7 +17,7 @@ __all__ = ["greedy", "transformer_greedy", "beam_search", "run_batch", "sample"]
 
 def greedy(src_mask: Tensor, max_output_length: int, model: Model,
            encoder_output: Tensor, encoder_hidden: Tensor, sample: bool, need_grad=False,
-           compute_log_probs=True) \
+           compute_log_probs=False) \
         -> (np.array, np.array):
     """
     Greedy decoding. Select the token word highest probability at each time
