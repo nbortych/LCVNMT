@@ -596,19 +596,17 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
     batch.src = batch.src.repeat(num_samples, 1)
     batch.src_mask = batch.src_mask.repeat(num_samples, 1, 1)
     batch.trg_mask = batch.trg_mask.repeat(num_samples, 1, 1)
+    logger.info(f" batch device in mbr {batch.src.device}")
     # [B*SxL, B*S]
     samples, log_probs = run_batch(model, batch, max_output_length=max_output_length, beam_size=1, beam_alpha=1,
-                                   sample=True,
-                                   need_grad=need_grad, compute_log_probs=compute_log_probs,
+                                   sample=True, need_grad=need_grad, compute_log_probs=compute_log_probs,
                                    encoded_batch=encoded_batch)
 
-    # [BxSxL]
-    samples = samples.reshape(batch_size, num_samples, -1)
-    # print("samples shape", samples.shape)
+    # [BxSxL] transpose is needed to make sure that it's actually split by batches
+    samples = samples.reshape(num_samples, batch_size, -1).transpose((1, 0, 2))
     if "log_probabilities" in return_types:
         # [BxS]
         log_probs = log_probs.reshape(batch_size, num_samples)
-        # print("log prob shape", log_probs.shape)
 
     if mbr_type == "editdistance":
         # define utility function

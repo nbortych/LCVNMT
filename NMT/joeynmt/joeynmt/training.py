@@ -17,6 +17,9 @@ import numpy as np
 import torch
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
+import torch.multiprocessing as mp
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from torchtext.data import Dataset
 
@@ -194,7 +197,8 @@ class TrainManager:
         self.use_cuda = train_config["use_cuda"] and torch.cuda.is_available()
         self.n_gpu = torch.cuda.device_count() if self.use_cuda else 0
         self.device = torch.device("cuda" if self.use_cuda else "cpu")
-        if self.use_cuda:
+        self.ddp = train_config.get("ddp", False)
+        if self.use_cuda and not self.ddp:
             self.model.to(self.device)
 
         # fp16
@@ -379,7 +383,16 @@ class TrainManager:
         :param train_data: training data
         :param valid_data: validation data
         """
-
+        if self.ddp:
+            gpu = None  # todo pass
+            rank = args.nr * args.gpus + gpu
+            dist.init_process_group(
+                backend='nccl',
+                init_method='env://',
+                world_size=args.world_size,
+                rank=rank
+            )
+            self.model = DDP(self.model, device_ids=[gpu])
         # if small test run, use subset of the data that is one batch
         if self.small_test_run:
             train_data, _ = train_data.split(0.00005)
@@ -883,6 +896,13 @@ def train(cfg_file: str) -> None:
          ckpt=ckpt,
          output_path=output_path,
          datasets=datasets_to_test)
+
+
+def spawn_multiprocess(train_fn, num_gpus=2, num_nodes=1):
+    args.world_size = num_gpus * num_nodes
+    os.environ['MASTER_ADDR'] = '145.101.32.61'  # lisa IP todo check if changes
+    os.environ['MASTER_PORT'] = '8888'  #
+    mp.spawn(train_fn, nprocs=num_gpus, args=(args,))
 
 
 if __name__ == "__main__":
