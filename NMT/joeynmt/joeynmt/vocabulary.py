@@ -6,8 +6,8 @@ Vocabulary module
 from collections import defaultdict, Counter
 from typing import List
 import numpy as np
-
-from torchtext.data import Dataset
+import torchtext
+from torchtext.legacy.data import Dataset
 
 from joeynmt.constants import UNK_TOKEN, DEFAULT_UNK_ID, \
     EOS_TOKEN, BOS_TOKEN, PAD_TOKEN
@@ -141,13 +141,11 @@ class Vocabulary:
         return sentences
 
 
-def build_vocab(field: str, max_size: int, min_freq: int, dataset: Dataset,
+def build_vocab(language: str, max_size: int, min_freq: int, dataset: Dataset,
                 vocab_file: str = None) -> Vocabulary:
     """
-    Builds vocabulary for a torchtext `field` from given`dataset` or
-    `vocab_file`.
+    Builds vocabulary for a given`dataset` or `vocab_file`.
 
-    :param field: attribute e.g. "src"
     :param max_size: maximum size of vocabulary
     :param min_freq: minimum frequency for an item to be included
     :param dataset: dataset to load data for field from
@@ -178,11 +176,11 @@ def build_vocab(field: str, max_size: int, min_freq: int, dataset: Dataset,
             return vocab_tokens
 
         tokens = []
-        for i in dataset.examples:
-            if field == "src":
-                tokens.extend(i.src)
-            elif field == "trg":
-                tokens.extend(i.trg)
+        for src, trg in dataset:
+            if language == "src":
+                tokens.extend(src)
+            elif language == "trg":
+                tokens.extend(trg)
 
         counter = Counter(tokens)
         if min_freq > -1:

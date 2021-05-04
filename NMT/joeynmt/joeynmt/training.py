@@ -21,7 +21,7 @@ import torch.multiprocessing as mp
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from torchtext.data import Dataset
+from torchtext.legacy.data import Dataset
 
 from joeynmt.model import build_model
 from joeynmt.batch import Batch
@@ -32,7 +32,7 @@ from joeynmt.helpers import log_data_info, load_config, log_cfg, \
 from joeynmt.model import Model, _DataParallel
 from joeynmt.prediction import validate_on_data
 from joeynmt.loss import XentLoss
-from joeynmt.data import load_data, make_data_iter
+from joeynmt.data import load_data, make_dataloader
 from joeynmt.builders import build_optimizer, build_scheduler, \
     build_gradient_clipper
 from joeynmt.prediction import test
@@ -67,6 +67,7 @@ class TrainManager:
         :param batch_class: batch class to encapsulate the torch class
         """
         train_config = config["training"]
+        self.train_config = train_config.copy()
         self.batch_class = batch_class
 
         # files for logging and storing
@@ -175,9 +176,10 @@ class TrainManager:
                                      "Valid options: 'word', 'bpe', 'char'.")
         self.shuffle = train_config.get("shuffle", True)
         self.epochs = train_config["epochs"]
+        self.epoch_no = 0
         self.batch_size = train_config["batch_size"]
         # Placeholder so that we can use the train_iter in other functions.
-        self.train_iter = None
+        self.dataloader = None
         self.train_iter_state = None
         # per-device batch_size = self.batch_size // self.n_gpu
         self.batch_type = train_config.get("batch_type", "sentence")
@@ -271,8 +273,8 @@ class TrainManager:
                 self.scheduler.state_dict() if self.scheduler is not None else None,
             'amp_state':
                 amp.state_dict() if self.fp16 else None,
-            "train_iter_state":
-                self.train_iter.state_dict()
+            "epoch_no":
+                self.epoch_no
         }
         torch.save(state, model_path)
         symlink_target = "{}.ckpt".format(self.stats.steps)
@@ -360,10 +362,11 @@ class TrainManager:
         else:
             logger.info("Reset tracking of the best checkpoint.")
 
-        if (not reset_iter_state
-                and model_checkpoint.get('train_iter_state', None) is not None):
-            self.train_iter_state = model_checkpoint["train_iter_state"]
-
+        # if (not reset_iter_state
+        #         and model_checkpoint.get('train_iter_state', None) is not None):
+        #     self.train_iter_state = model_checkpoint["train_iter_state"]
+        # reset the epoch
+        self.epoch_no = model_checkpoint['epoch_no']
         # move parameters to cuda
         if self.use_cuda:
             self.model.to(self.device)
@@ -395,21 +398,28 @@ class TrainManager:
             self.model = DDP(self.model, device_ids=[gpu])
         # if small test run, use subset of the data that is one batch
         if self.small_test_run:
-            train_data, _ = train_data.split(0.00005)
-            small_data_size = len(train_data)
-            logger.info(f"The lenght of data is {small_data_size}")
-            self.batch_size = small_data_size
+            SMALL_DATA_SIZE = 5
+            train_subset_data, _ = torch.utils.data.random_split(train_data,
+                                                          [SMALL_DATA_SIZE, len(train_data) - SMALL_DATA_SIZE],
+                                                          torch.Generator().manual_seed(self.train_config.get("random_seed", 42)))
+            train_subset_data.src_vocab = train_data.src_vocab
+            train_subset_data.trg_vocab = train_data.trg_vocab
+            train_data = train_subset_data
+            logger.info(f"The lenght of data is {SMALL_DATA_SIZE}")
+            self.batch_size = SMALL_DATA_SIZE
             self.epochs = 2
             self.validation_freq = 10000
 
-        self.train_iter = make_data_iter(train_data,
+        self.dataloader = make_dataloader(train_data,
                                          batch_size=self.batch_size,
                                          batch_type=self.batch_type,
                                          train=True,
                                          shuffle=self.shuffle)
 
+        # todo save dataloader state dict
         if self.train_iter_state is not None:
-            self.train_iter.load_state_dict(self.train_iter_state)
+            print("Loading state")
+            self.dataloader.load_state_dict(self.train_iter_state)
 
         #################################################################
         # simplify accumulation logic:
@@ -418,7 +428,7 @@ class TrainManager:
         #     self.model.zero_grad()
         #     epoch_loss = 0.0
         #     batch_loss = 0.0
-        #     for i, batch in enumerate(iter(self.train_iter)):
+        #     for i, batch in enumerate(iter(self.dataloader)):
         #
         #         # gradient accumulation:
         #         # loss.backward() inside _train_step()
@@ -452,7 +462,7 @@ class TrainManager:
             epoch_no = 0
             self._save_checkpoint(True)
 
-        for epoch_no in range(self.epochs):
+        for epoch_no in range(self.epoch_no, self.epochs):
             logger.info("EPOCH %d", epoch_no + 1)
 
             if self.scheduler is not None and self.scheduler_step_at == "epoch":
@@ -468,9 +478,15 @@ class TrainManager:
             self.model.zero_grad()
             epoch_loss = 0
             batch_loss = 0
+            self.epoch_no = epoch_no
 
-            for i, batch in enumerate(iter(self.train_iter)):
-                # create a Batch object from torchtext batch
+            for i, batch in enumerate(self.dataloader):
+                # print(1,batch[0].shape, batch)
+                # print(2, next(iter(self.dataloader)))
+                # print(3, next(iter(self.dataloader)))
+                #
+                # quit()
+                # create a Batch object from torch batch
                 batch = self.batch_class(batch, self.model.pad_index,
                                          use_cuda=self.use_cuda)
                 # print(batch.src.shape, batch.src_length)

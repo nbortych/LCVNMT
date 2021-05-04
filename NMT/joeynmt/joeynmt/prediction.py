@@ -12,7 +12,7 @@ import editdistance
 
 import numpy as np
 import torch
-from torchtext.data import Dataset, Field
+from torchtext.legacy.data import Dataset, Field
 
 from joeynmt.helpers import bpe_postprocess, load_config, make_logger, \
     get_latest_checkpoint, load_checkpoint, store_attention_plots
@@ -20,7 +20,7 @@ from joeynmt.metrics import bleu, chrf, token_accuracy, sequence_accuracy
 from joeynmt.model import build_model, Model, _DataParallel
 from joeynmt.search import run_batch
 from joeynmt.batch import Batch
-from joeynmt.data import load_data, make_data_iter, MonoDataset
+from joeynmt.data import load_data, make_dataloader, MonoDataset
 from joeynmt.constants import UNK_TOKEN, PAD_TOKEN, EOS_TOKEN
 from joeynmt.vocabulary import Vocabulary
 
@@ -104,15 +104,23 @@ def validate_on_data(model: Model, data: Dataset,
             " 'eval_batch_type: token'.")
 
     # if small test run, use subset of the data that is one batch
+    # todo modernize
     if small_test_run:
-        data, _ = data.split(0.0005)
+        SMALL_DATA_SIZE = 5
+
+        val_subset_data, _ = torch.utils.data.random_split(data,
+                                                           [SMALL_DATA_SIZE, len(data) - SMALL_DATA_SIZE],
+                                                           torch.Generator().manual_seed(42))
+        val_subset_data.src_vocab = data.src_vocab
+        val_subset_data.trg_vocab = data.trg_vocab
+        data = val_subset_data
         logger.info(f"The lenght of validation data for small test run is {len(data)}")
         # batch_size = len(data)
 
-    valid_iter = make_data_iter(
-        dataset=data, batch_size=batch_size, batch_type=batch_type,
+    valid_dataloader = make_dataloader(
+        dataset=data, batch_size=batch_size,
         shuffle=False, train=False)
-    valid_sources_raw = data.src
+    valid_sources_raw = [src for src, trg in data]
     pad_index = model.src_vocab.stoi[PAD_TOKEN]
     # disable dropout
     model.eval()
@@ -123,10 +131,10 @@ def validate_on_data(model: Model, data: Dataset,
         total_loss = 0
         total_ntokens = 0
         total_nseqs = 0
-        for valid_batch in iter(valid_iter):
+        for valid_batch in valid_dataloader:
             # run as during training to get validation loss (e.g. xent)
 
-            batch = batch_class(valid_batch, pad_index, use_cuda=use_cuda)
+            batch = batch_class(valid_batch, pad_index, use_cuda=use_cuda, compute_len=True)
             # sort batch now by src length and keep track of order
             sort_reverse_index = batch.sort_by_src_length()
 
@@ -174,8 +182,8 @@ def validate_on_data(model: Model, data: Dataset,
 
         # evaluate with metric on full dataset
         join_char = " " if level in ["word", "bpe"] else ""
-        valid_sources = [join_char.join(s) for s in data.src]
-        valid_references = [join_char.join(t) for t in data.trg]
+        valid_sources_and_references = [(join_char.join(s), join_char.join(t)) for s, t in data]
+        valid_sources, valid_references = zip(*valid_sources_and_references)
         valid_hypotheses = [join_char.join(t) for t in decoded_valid]
 
         # post-process
@@ -219,7 +227,6 @@ def validate_on_data(model: Model, data: Dataset,
             utility = 0
 
         # saves utility per sentence. Not implemented yet
-        # todo implement. ask Wilker more about utility
         # if save_utility_per_sentence:
         #     get_utility_per_sentence(eval_metric.lower(), valid_hypotheses, valid_references)
 
@@ -395,13 +402,13 @@ def test(cfg_file,
             save_utility_per_sentence=save_utility_per_sentence, utility_type=utility_type)
         # pylint: enable=unused-variable
 
-        if "trg" in data_set.fields:
-            logger.info("%4s %s%s: %6.2f [%s]",
-                        data_set_name, eval_metric, tokenizer_info,
-                        score, decoding_description)
-        else:
-            logger.info("No references given for %s -> no evaluation.",
-                        data_set_name)
+        # if "trg" in data_set.fields:
+        logger.info("%4s %s%s: %6.2f [%s]",
+                    data_set_name, eval_metric, tokenizer_info,
+                    score, decoding_description)
+        # else:
+        #     logger.info("No references given for %s -> no evaluation.",
+        #                 data_set_name)
 
         if save_attention:
             if attention_scores:
@@ -467,6 +474,7 @@ def translate(cfg_file: str,
         return test_data
 
     def _translate_data(test_data):
+        # todo modernize data
         """ Translates given dataset, using parameters from outer scope. """
         # pylint: disable=unused-variable
         score, loss, ppl, sources, sources_raw, references, hypotheses, \

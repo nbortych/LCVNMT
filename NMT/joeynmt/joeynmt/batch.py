@@ -10,8 +10,9 @@ class Batch:
     """Object for holding a batch of data with mask during training.
     Input is a batch from a torch text iterator.
     """
+
     # pylint: disable=too-many-instance-attributes
-    def __init__(self, torch_batch, pad_index, use_cuda=False):
+    def __init__(self, torch_batch, pad_index, use_cuda=False, compute_len=False):
         """
         Create a new joey batch from a torch batch.
         This batch extends torch text's batch attributes with src and trg
@@ -22,27 +23,22 @@ class Batch:
         :param pad_index:
         :param use_cuda:
         """
-        self.src, self.src_length = torch_batch.src
+        if compute_len:
+            self.src, self.src_length, self.trg, self.trg_length = torch_batch
+        else:
+            self.src, self.trg = torch_batch
+            self.src_length, self.trg_length = None, None
         self.src_mask = (self.src != pad_index).unsqueeze(1)
         self.nseqs = self.src.size(0)
-        self.trg_input = None
-        self.trg = None
-        self.trg_mask = None
-        self.trg_length = None
-        self.ntokens = None
+        # trg_input is used for teacher forcing, last one is cut off
+        self.trg_input = self.trg[:, :-1]
+        # we exclude the padded areas from the loss computation
+        self.trg_mask = (self.trg_input != pad_index).unsqueeze(1)
+        # trg is used for loss computation, shifted by one since BOS
+        self.trg = self.trg[:, 1:]
+        self.ntokens = (self.trg != pad_index).data.sum().item()
         self.use_cuda = use_cuda
         self.device = torch.device("cuda" if self.use_cuda else "cpu")
-
-        if hasattr(torch_batch, "trg"):
-            trg, trg_length = torch_batch.trg
-            # trg_input is used for teacher forcing, last one is cut off
-            self.trg_input = trg[:, :-1]
-            self.trg_length = trg_length
-            # trg is used for loss computation, shifted by one since BOS
-            self.trg = trg[:, 1:]
-            # we exclude the padded areas from the loss computation
-            self.trg_mask = (self.trg_input != pad_index).unsqueeze(1)
-            self.ntokens = (self.trg != pad_index).data.sum().item()
 
         if self.use_cuda:
             self._make_cuda()
@@ -69,7 +65,7 @@ class Batch:
         :return:
         """
         _, perm_index = self.src_length.sort(0, descending=True)
-        rev_index = [0]*perm_index.size(0)
+        rev_index = [0] * perm_index.size(0)
         for new_pos, old_pos in enumerate(perm_index.cpu().numpy()):
             rev_index[old_pos] = new_pos
 

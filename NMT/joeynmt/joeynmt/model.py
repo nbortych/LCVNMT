@@ -97,7 +97,6 @@ class Model(nn.Module):
 
             # compute log probs
             log_probs = F.log_softmax(out, dim=-1)
-            print("1")
             # compute batch loss
             batch_loss = self.loss_function(log_probs, kwargs["trg"])
             utility_reg = kwargs.get("utility_regularising", False)  # self.loss_function.utility_regularising
