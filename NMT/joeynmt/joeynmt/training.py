@@ -13,6 +13,7 @@ import sys
 import collections
 import pathlib
 import numpy as np
+import pickle
 
 import torch
 from torch import Tensor
@@ -36,6 +37,7 @@ from joeynmt.data import load_data, make_dataloader
 from joeynmt.builders import build_optimizer, build_scheduler, \
     build_gradient_clipper
 from joeynmt.prediction import test
+from joeynmt.vocabulary import build_vocab
 
 # for debug purposes
 # torch.autograd.set_detect_anomaly(True)
@@ -81,7 +83,8 @@ class TrainManager:
         # logging
         self.logging_freq = train_config.get("logging_freq", 100)
         self.valid_report_file = "{}/validations.txt".format(self.model_dir)
-        self.tb_writer = SummaryWriter(log_dir=self.model_dir + "/tensorboard/")
+        self.tb_writer = None # set later
+
 
         self.save_latest_checkpoint = train_config.get("save_latest_ckpt", True)
 
@@ -161,7 +164,6 @@ class TrainManager:
                 .get("tokenize", "13a")
 
         self.sample = test_config.get("sample", False)
-
         # learning rate scheduling
         self.scheduler, self.scheduler_step_at = build_scheduler(
             config=train_config,
@@ -200,6 +202,9 @@ class TrainManager:
         self.n_gpu = torch.cuda.device_count() if self.use_cuda else 0
         self.device = torch.device("cuda" if self.use_cuda else "cpu")
         self.ddp = train_config.get("ddp", False)
+
+        # if self.use_cuda:
+        #     torch.cuda.empty_cache()
         if self.use_cuda and not self.ddp:
             self.model.to(self.device)
 
@@ -238,6 +243,7 @@ class TrainManager:
         if self.n_gpu > 1:
             self.model = _DataParallel(self.model)
 
+# class Decomment():
     def _save_checkpoint(self, new_best: bool = True) -> None:
         """
         Save the model's current parameters and the training state to a
@@ -378,7 +384,7 @@ class TrainManager:
     # pylint: disable=unnecessary-comprehension
     # pylint: disable=too-many-branches
     # pylint: disable=too-many-statements
-    def train_and_validate(self, train_data: Dataset, valid_data: Dataset) \
+    def train_and_validate(self, gpu: int=0, train_data: Dataset = None, valid_data: Dataset = None) \
             -> None:
         """
         Train the model and validate it from time to time on the validation set.
@@ -386,22 +392,15 @@ class TrainManager:
         :param train_data: training data
         :param valid_data: validation data
         """
-        if self.ddp:
-            gpu = None  # todo pass
-            rank = args.nr * args.gpus + gpu
-            dist.init_process_group(
-                backend='nccl',
-                init_method='env://',
-                world_size=args.world_size,
-                rank=rank
-            )
-            self.model = DDP(self.model, device_ids=[gpu])
+        print("!!!!!")
+        logger.info("Initialised")
         # if small test run, use subset of the data that is one batch
         if self.small_test_run:
-            SMALL_DATA_SIZE = 5
+            SMALL_DATA_SIZE = 6
             train_subset_data, _ = torch.utils.data.random_split(train_data,
-                                                          [SMALL_DATA_SIZE, len(train_data) - SMALL_DATA_SIZE],
-                                                          torch.Generator().manual_seed(self.train_config.get("random_seed", 42)))
+                                                                 [SMALL_DATA_SIZE, len(train_data) - SMALL_DATA_SIZE],
+                                                                 torch.Generator().manual_seed(
+                                                                     self.train_config.get("random_seed", 42)))
             train_subset_data.src_vocab = train_data.src_vocab
             train_subset_data.trg_vocab = train_data.trg_vocab
             train_data = train_subset_data
@@ -409,17 +408,39 @@ class TrainManager:
             self.batch_size = SMALL_DATA_SIZE
             self.epochs = 2
             self.validation_freq = 10000
+        # if Distributed Data Parallel
+        if self.ddp:
+            logger.info(f"Got into training, gpu is {gpu}")
+            # todo pass arguments to make sure it works with multinode training
+            gpu = gpu
+            world_size = 2
+            rank = gpu
+            dist.init_process_group(
+                backend='gloo', #nccl
+                init_method='env://',
+                world_size=world_size,
+                rank=rank
+            )
+            logger.info(f"Process group initialised")
+
+            self.model = DDP(self.model.to(gpu), device_ids=[gpu])
+            logger.info(f"Model wrapped")
+
+            train_sampler = torch.utils.data.distributed.DistributedSampler(
+                train_dataset,
+                num_replicas=world_size,
+                rank=rank
+            )
+            self.batch.device = gpu
+        else:
+            train_sampler = None
 
         self.dataloader = make_dataloader(train_data,
-                                         batch_size=self.batch_size,
-                                         batch_type=self.batch_type,
-                                         train=True,
-                                         shuffle=self.shuffle)
-
-        # todo save dataloader state dict
-        if self.train_iter_state is not None:
-            print("Loading state")
-            self.dataloader.load_state_dict(self.train_iter_state)
+                                          batch_size=self.batch_size,
+                                          batch_type=self.batch_type,
+                                          train=True,
+                                          shuffle=self.shuffle if train_sampler is None else False,
+                                          sampler=train_sampler)
 
         #################################################################
         # simplify accumulation logic:
@@ -479,13 +500,10 @@ class TrainManager:
             epoch_loss = 0
             batch_loss = 0
             self.epoch_no = epoch_no
+            if self.ddp:
+                train_sampler.set_epoch(self.epoch_no)
 
             for i, batch in enumerate(self.dataloader):
-                # print(1,batch[0].shape, batch)
-                # print(2, next(iter(self.dataloader)))
-                # print(3, next(iter(self.dataloader)))
-                #
-                # quit()
                 # create a Batch object from torch batch
                 batch = self.batch_class(batch, self.model.pad_index,
                                          use_cuda=self.use_cuda)
@@ -760,7 +778,10 @@ class TrainManager:
         """
         Write all model parameters (name, shape) to the log.
         """
-        model_parameters = filter(lambda p: p.requires_grad,
+
+        def req_grad(p): return p.requires_grad
+
+        model_parameters = filter(req_grad,
                                   self.model.parameters())
         n_params = sum([np.prod(p.size()) for p in model_parameters])
         logger.info("Total params: %d", n_params)
@@ -768,7 +789,8 @@ class TrainManager:
             n for (n, p) in self.model.named_parameters() if p.requires_grad
         ]
         logger.debug("Trainable parameters: %s", sorted(trainable_params))
-        assert trainable_params
+        # todo remove
+        # assert trainable_params
 
     def _log_examples(self,
                       sources: List[str],
@@ -866,25 +888,33 @@ def train(cfg_file: str) -> None:
     set_seed(seed=cfg["training"].get("random_seed", 42))
 
     # load the data
-    train_data, dev_data, test_data, src_vocab, trg_vocab = load_data(
-        data_cfg=cfg["data"])
+    if not cfg["training"].get("skip_vocab", True):
+        train_data, dev_data, test_data, src_vocab, trg_vocab = load_data(
+            data_cfg=cfg["data"])
+    else:
+        train_data, dev_data, test_data = [(['1', '2'], ['1', '2']), (['1', '2'], ['1', '2'])]*3
+        src_vocab = build_vocab(language="src", min_freq=0, max_size=2,
+                                dataset=train_data)
+        trg_vocab = build_vocab(language="trg", min_freq=0, max_size=2,
+                                dataset=train_data)
     # build an encoder-decoder model
     model = build_model(cfg["model"], src_vocab=src_vocab, trg_vocab=trg_vocab)
 
     # for training management, e.g. early stopping and model selection
     trainer = TrainManager(model=model, config=cfg)
-
+    # todo decomment
+    # trainer.tb_writer = SummaryWriter(log_dir=model_dir + "/tensorboard/")
     # store copy of original training config in model dir
     shutil.copy2(cfg_file, model_dir + "/config.yaml")
 
     # log all entries of config
     log_cfg(cfg)
-
-    log_data_info(train_data=train_data,
-                  valid_data=dev_data,
-                  test_data=test_data,
-                  src_vocab=src_vocab,
-                  trg_vocab=trg_vocab)
+    if not cfg["training"].get("skip_vocab", True):
+        log_data_info(train_data=train_data,
+                      valid_data=dev_data,
+                      test_data=test_data,
+                      src_vocab=src_vocab,
+                      trg_vocab=trg_vocab)
 
     logger.info(str(model))
 
@@ -893,9 +923,13 @@ def train(cfg_file: str) -> None:
     src_vocab.to_file(src_vocab_file)
     trg_vocab_file = "{}/trg_vocab.txt".format(cfg["training"]["model_dir"])
     trg_vocab.to_file(trg_vocab_file)
-
-    # train the model
-    trainer.train_and_validate(train_data=train_data, valid_data=dev_data)
+    if not cfg["training"].get("ddp", False):
+        # train the model
+        trainer.train_and_validate(train_data=train_data, valid_data=dev_data)
+    else:
+        # b = pickle.dumps(trainer)
+        # logger.info("Pickling success")
+        spawn_multiprocess(trainer.train_and_validate, (train_data, dev_data))
 
     # predict with the best model on validation and test
     # (if test data is available)
@@ -914,11 +948,15 @@ def train(cfg_file: str) -> None:
          datasets=datasets_to_test)
 
 
-def spawn_multiprocess(train_fn, num_gpus=2, num_nodes=1):
-    args.world_size = num_gpus * num_nodes
-    os.environ['MASTER_ADDR'] = '145.101.32.61'  # lisa IP todo check if changes
-    os.environ['MASTER_PORT'] = '8888'  #
-    mp.spawn(train_fn, nprocs=num_gpus, args=(args,))
+def spawn_multiprocess(train_fn, args, num_gpus=2, num_nodes=1):
+    # args.world_size = num_gpus * num_nodes
+    os.environ['MASTER_ADDR'] = '127.0.0.1'  # lisa IP
+    os.environ['MASTER_PORT'] = '9028' #29500
+    # os.environ['MKL_SERVICE_FORCE_INTEL']='1'
+    # os.environ['MKL_THREADING_LAYER']='GNU'
+    logger.info("Spawning multiple GPUs")
+    mp.spawn(train_fn, nprocs=num_gpus, args=args, join=True)
+    logger.info("Multiple GPUs are done")
 
 
 if __name__ == "__main__":

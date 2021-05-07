@@ -90,6 +90,10 @@ class Model(nn.Module):
             # logger.info(f"Batch shape {kwargs['src'].shape}, src mask {kwargs['src_mask'].shape}, src length {kwargs['src_length']}")
             # out, hidden, _, _ = self._encode_decode(**kwargs)
             # encode and decode explicitly to save encoded for sampling
+            # for key, item in kwargs.items():
+            #     logger.info(f"{key}, {item}")
+            #     if hasattr(item, "device"):
+            #         logger.info(f"Device is {item.device}")
             encoder_output, encoder_hidden = self._encode(**kwargs)
             unroll_steps = kwargs['trg_input'].size(1)
             out, hidden, _, _ = self._decode(encoder_output=encoder_output, encoder_hidden=encoder_hidden,

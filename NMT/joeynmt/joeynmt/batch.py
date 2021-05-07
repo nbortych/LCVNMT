@@ -51,7 +51,8 @@ class Batch:
         """
         self.src = self.src.to(self.device)
         self.src_mask = self.src_mask.to(self.device)
-        self.src_length = self.src_length.to(self.device)
+        if self.src_length is not None:
+            self.src_length = self.src_length.to(self.device)
 
         if self.trg_input is not None:
             self.trg_input = self.trg_input.to(self.device)
