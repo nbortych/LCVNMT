@@ -104,7 +104,6 @@ def validate_on_data(model: Model, data: Dataset,
             " 'eval_batch_type: token'.")
 
     # if small test run, use subset of the data that is one batch
-    # todo modernize
     if small_test_run:
         SMALL_DATA_SIZE = 5
 
@@ -120,7 +119,7 @@ def validate_on_data(model: Model, data: Dataset,
     valid_dataloader = make_dataloader(
         dataset=data, batch_size=batch_size,
         shuffle=False, train=False)
-    valid_sources_raw = [src for src, trg in data]
+    valid_sources_raw = [src for src,_, trg,_ in data]
     pad_index = model.src_vocab.stoi[PAD_TOKEN]
     # disable dropout
     model.eval()
@@ -134,7 +133,7 @@ def validate_on_data(model: Model, data: Dataset,
         for valid_batch in valid_dataloader:
             # run as during training to get validation loss (e.g. xent)
 
-            batch = batch_class(valid_batch, pad_index, use_cuda=use_cuda, compute_len=True)
+            batch = batch_class(valid_batch, pad_index, use_cuda=use_cuda)
             # sort batch now by src length and keep track of order
             sort_reverse_index = batch.sort_by_src_length()
 
@@ -182,7 +181,7 @@ def validate_on_data(model: Model, data: Dataset,
 
         # evaluate with metric on full dataset
         join_char = " " if level in ["word", "bpe"] else ""
-        valid_sources_and_references = [(join_char.join(s), join_char.join(t)) for s, t in data]
+        valid_sources_and_references = [(join_char.join(s), join_char.join(t)) for s,_, t,_ in data]
         valid_sources, valid_references = zip(*valid_sources_and_references)
         valid_hypotheses = [join_char.join(t) for t in decoded_valid]
 

@@ -12,7 +12,7 @@ class Batch:
     """
 
     # pylint: disable=too-many-instance-attributes
-    def __init__(self, torch_batch, pad_index, use_cuda=False, compute_len=False):
+    def __init__(self, torch_batch, pad_index, use_cuda=False, device=None):
         """
         Create a new joey batch from a torch batch.
         This batch extends torch text's batch attributes with src and trg
@@ -23,11 +23,8 @@ class Batch:
         :param pad_index:
         :param use_cuda:
         """
-        if compute_len:
-            self.src, self.src_length, self.trg, self.trg_length = torch_batch
-        else:
-            self.src, self.trg = torch_batch
-            self.src_length, self.trg_length = None, None
+        self.src, self.src_length, self.trg, self.trg_length = torch_batch
+
         self.src_mask = (self.src != pad_index).unsqueeze(1)
         self.nseqs = self.src.size(0)
         # trg_input is used for teacher forcing, last one is cut off
@@ -38,7 +35,8 @@ class Batch:
         self.trg = self.trg[:, 1:]
         self.ntokens = (self.trg != pad_index).data.sum().item()
         self.use_cuda = use_cuda
-        self.device = torch.device("cuda" if self.use_cuda else "cpu")
+
+        self.device = torch.device("cuda" if self.use_cuda else "cpu") if device is None else device
 
         if self.use_cuda:
             self._make_cuda()
@@ -51,8 +49,7 @@ class Batch:
         """
         self.src = self.src.to(self.device)
         self.src_mask = self.src_mask.to(self.device)
-        if self.src_length is not None:
-            self.src_length = self.src_length.to(self.device)
+        self.src_length = self.src_length.to(self.device)
 
         if self.trg_input is not None:
             self.trg_input = self.trg_input.to(self.device)

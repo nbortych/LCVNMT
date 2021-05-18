@@ -11,13 +11,12 @@ from typing import Optional
 import logging
 
 import torch
-from torch.utils.data import Dataset, DataLoader
-
+from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.utils.data.distributed import DistributedSampler
 from torchtext.legacy.datasets import TranslationDataset
 from torchtext.legacy import data
 # from torchtext.legacy.data import Dataset, Iterator, Field
 from torch.nn.utils.rnn import pad_sequence
-
 
 from joeynmt.constants import UNK_TOKEN, EOS_TOKEN, BOS_TOKEN, PAD_TOKEN
 from joeynmt.vocabulary import build_vocab, Vocabulary
@@ -133,7 +132,9 @@ def make_dataloader(dataset: Dataset,
                     batch_size: int,
                     batch_type: str = "sentence",
                     train: bool = True,
-                    shuffle: bool = False) -> DataLoader:
+                    shuffle: bool = False,
+                    sampler: Sampler = None,
+                    batch_sampler: Sampler = None) -> DataLoader:
     """
     Returns a dataloader for a dataset.
 
@@ -141,6 +142,7 @@ def make_dataloader(dataset: Dataset,
     :param batch_size: size of the batches the iterator prepares
     :param train: whether it's training time, when turned off,
         bucketing, sorting within batches and shuffling is disabled
+        and lengths will be returned
     :param shuffle: whether to shuffle the data before each epoch
         (no effect if set to True for testing)
     :return: torch dataloader
@@ -149,35 +151,94 @@ def make_dataloader(dataset: Dataset,
     def generate_batch(data_batch):
         src_batch, trg_batch = [], []
         # we need to compute length for validation
-        if not train:
-            src_len, trg_len = [], []
-        for (src, trg) in data_batch:
+        src_len_batch, trg_len_batch = [], []
+        for (src, src_len, trg, trg_len) in data_batch:
             # transform raw text into vocab indices
             src_batch.append(vocab_transform(src, src_vocab))
             trg_batch.append(vocab_transform(trg, trg_vocab))
-            if not train:
-                src_len.append(len(src))
-                trg_len.append(len(trg))
+            # append length
+            src_len_batch.append(src_len)
+            trg_len_batch.append(trg_len)
 
-        if train:
-            return pad_sequence(src_batch, batch_first=True, padding_value=src_vocab.stoi[PAD_TOKEN]), pad_sequence(trg_batch, batch_first=True, padding_value=trg_vocab.stoi[PAD_TOKEN])
-        else:
-            return pad_sequence(src_batch, batch_first=True, padding_value=src_vocab.stoi[PAD_TOKEN]), torch.tensor(src_len), pad_sequence(trg_batch, batch_first=True, padding_value=trg_vocab.stoi[PAD_TOKEN]),  torch.tensor(trg_len)
+        return pad_sequence(src_batch, batch_first=True, padding_value=src_vocab.stoi[PAD_TOKEN]), torch.tensor(
+            src_len_batch), \
+               pad_sequence(trg_batch, batch_first=True, padding_value=trg_vocab.stoi[PAD_TOKEN]), torch.tensor(
+            trg_len_batch)
 
     src_vocab = dataset.src_vocab
     trg_vocab = dataset.trg_vocab
-    vocab_transform = lambda x, vocab: torch.tensor([vocab.stoi[BOS_TOKEN]] + [vocab.stoi[token] for token in x] + [vocab.stoi[EOS_TOKEN]])
-    if train:
-        # optionally shuffle and sort during training
-        dataloader = DataLoader(dataset, batch_size=batch_size,
-                                shuffle=shuffle, collate_fn=generate_batch)
-        print(dataloader)
-    else:
-        # don't sort/shuffle for validation/inference
-        dataloader = DataLoader(dataset, batch_size=batch_size,
-                                shuffle=False, collate_fn=generate_batch)
+
+    def vocab_transform(x, vocab):
+        return torch.tensor(
+            [vocab.stoi[BOS_TOKEN]] + [vocab.stoi[token] for token in x] + [vocab.stoi[EOS_TOKEN]])
+
+    kwargs = {"batch_size": batch_size,
+              "shuffle": shuffle, "collate_fn": generate_batch,
+              "sampler": sampler, "batch_sampler": batch_sampler}
+    # if not training, we want the same order every time
+    if not train:
+        kwargs['shuffle'] = False
+    # make sure that batch sampler has no incompatible keywords
+    if batch_sampler is not None:
+        assert sampler is None, "You've passed both batch sampler and sampler to Dataloader"
+        del kwargs['shuffle']
+        del kwargs['batch_size']
+    # make sure that sampler has no incompatbile keywords
+    if sampler is not None:
+        assert batch_sampler is None, "You've passed both batch sampler and sampler to Dataloader"
+
+    dataloader = DataLoader(dataset, **kwargs)
 
     return dataloader
+
+
+class BatchSamplerSimilarLength(Sampler):
+    def __init__(self, dataset, batch_size, indices=None, shuffle=True):
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        # get the indicies and length
+        self.indices = [(i, src_len) for i, (src, src_len, trg, trg_len) in enumerate(dataset)]
+        if indices is not None:
+            self.indices = self.indices[indices]
+
+    def __iter__(self):
+        if self.shuffle:
+            random.shuffle(self.indices)
+
+        pooled_indices = []
+        # create pool of indices with similar lengths
+        for i in range(0, len(self.indices), self.batch_size * 100):
+            pooled_indices.extend(sorted(self.indices[i:i + self.batch_size * 100], key=lambda x: x[1]))
+        self.pooled_indices = [x[0] for x in pooled_indices]
+
+        # yield indices for current batch
+        batches = [self.pooled_indices[i:i + self.batch_size] for i in
+                   range(0, len(self.pooled_indices), self.batch_size)]
+
+        if self.shuffle:
+            random.shuffle(batches)
+        for batch in batches:
+            yield batch
+
+    def __len__(self):
+        return len(self.pooled_indices) // self.batch_size
+
+
+class DistributedBatchSamplerSimilarLength(DistributedSampler):
+    def __init__(self, dataset: Dataset, num_replicas: Optional[int] = None,
+                 rank: Optional[int] = None, shuffle: bool = True,
+                 seed: int = 0, drop_last: bool = False, batch_size=10) -> None:
+        super().__init__(dataset=dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle, seed=seed,
+                         drop_last=drop_last)
+        self.batch_size = batch_size
+
+    def __iter__(self):
+        indices = list(super.__iter__())
+        batch_sampler = BatchSamplerSimilarLength(self.dataset, batch_size=self.batch_size, indices=indices)
+        return iter(batch_sampler)
+
+    def __len__(self) -> int:
+        return self.num_samples // batch_size
 
 
 class TranslationTextDataset(Dataset):
@@ -209,12 +270,12 @@ class TranslationTextDataset(Dataset):
                     # seperate into words
                     src_line, trg_line = src_line.split(), trg_line.split()
                     # if vocab is provided, transform into indices
-                    # todo include lengths?
-                    # src_len, trg_len = len(src_line), len(trg_line)
-                    # if src_len<=max_sent_length and trg_len<=max_sent_length:
-                    # if vocab is None:
-                    self.data.append((src_line, trg_line))
-                    # else:
+                    # add lengths. choosing to do so, since length is needed in many things
+                    src_len, trg_len = len(src_line), len(trg_line)
+                    # make sure we don't append too big of examples
+                    if src_len <= max_sent_length and trg_len <= max_sent_length:
+                        self.data.append((src_line, src_len, trg_line, trg_len))
+                    # if vocab is not None:
                     #     self.data.append((vocab_transform(src_line), vocab_transform(trg_line)))
 
         self.len_data = len(self.data)

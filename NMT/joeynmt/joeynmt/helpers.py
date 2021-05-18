@@ -155,7 +155,7 @@ def log_data_info(train_data: Dataset, valid_data: Dataset, test_data: Dataset,
 
     logger.info("First training example:\n\t[SRC] %s\n\t[TRG] %s",
                 " ".join(train_data[0][0]),
-                " ".join(train_data[0][1]))
+                " ".join(train_data[0][2]))
 
     logger.info(
         "First 10 words (src): %s",

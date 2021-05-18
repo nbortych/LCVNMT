@@ -47,7 +47,7 @@ class Vocabulary:
 
         :param tokens: list of tokens
         """
-        self.add_tokens(tokens=self.specials+tokens)
+        self.add_tokens(tokens=self.specials + tokens)
         assert len(self.stoi) == len(self.itos)
 
     def _from_file(self, file: str) -> None:
@@ -123,7 +123,7 @@ class Vocabulary:
         return sentence
 
     def arrays_to_sentences(self, arrays: np.array, cut_at_eos=True,
-                            skip_pad=True, join_sentence = False) -> List[List[str]]:
+                            skip_pad=True, join_sentence=False) -> List[List[str]]:
         """
         Convert multiple arrays containing sequences of token IDs to their
         sentences, optionally cutting them off at the end-of-sequence token.
@@ -176,7 +176,7 @@ def build_vocab(language: str, max_size: int, min_freq: int, dataset: Dataset,
             return vocab_tokens
 
         tokens = []
-        for src, trg in dataset:
+        for src, _, trg, _ in dataset:
             if language == "src":
                 tokens.extend(src)
             elif language == "trg":

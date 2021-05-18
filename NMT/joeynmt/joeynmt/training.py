@@ -20,7 +20,6 @@ from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 import torch.multiprocessing as mp
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 from torchtext.legacy.data import Dataset
 
@@ -30,10 +29,11 @@ from joeynmt.helpers import log_data_info, load_config, log_cfg, \
     store_attention_plots, load_checkpoint, make_model_dir, \
     make_logger, set_seed, symlink_update, latest_checkpoint_update, \
     ConfigurationError
-from joeynmt.model import Model, _DataParallel
+from joeynmt.model import Model, _DataParallel, _DistributedDataParallel
 from joeynmt.prediction import validate_on_data
 from joeynmt.loss import XentLoss
-from joeynmt.data import load_data, make_dataloader
+from joeynmt.data import load_data, make_dataloader, BatchSamplerSimilarLength, \
+    DistributedBatchSamplerSimilarLength
 from joeynmt.builders import build_optimizer, build_scheduler, \
     build_gradient_clipper
 from joeynmt.prediction import test
@@ -83,8 +83,7 @@ class TrainManager:
         # logging
         self.logging_freq = train_config.get("logging_freq", 100)
         self.valid_report_file = "{}/validations.txt".format(self.model_dir)
-        self.tb_writer = None # set later
-
+        self.tb_writer = None  # set inside the training due to ddp
 
         self.save_latest_checkpoint = train_config.get("save_latest_ckpt", True)
 
@@ -101,8 +100,7 @@ class TrainManager:
         self.model._utility_alpha = self.utility_alpha
         self.model._num_samples = self.num_samples
         self.model.loss_function = XentLoss(pad_index=self.model.pad_index,
-                                            smoothing=self.label_smoothing,
-                                            utility_regularising=self.utility_regularising)
+                                            smoothing=self.label_smoothing)
         self.normalization = train_config.get("normalization", "batch")
         if self.normalization not in ["batch", "tokens", "none"]:
             raise ConfigurationError("Invalid normalization option."
@@ -200,8 +198,13 @@ class TrainManager:
         # CPU / GPU
         self.use_cuda = train_config["use_cuda"] and torch.cuda.is_available()
         self.n_gpu = torch.cuda.device_count() if self.use_cuda else 0
+        logger.info(f"NUMBER OF GPUS IS {self.n_gpu}{'!'*100}")
         self.device = torch.device("cuda" if self.use_cuda else "cpu")
         self.ddp = train_config.get("ddp", False)
+        self.num_nodes = train_config.get("num_nodes", 1)
+        self.node_nr = train_config.get("node_nr", 0)
+        self.world_size = self.num_nodes * self.n_gpu
+        self.distributed_batch_sampler = train_config.get("distributed_batch_sampler", False)
 
         # if self.use_cuda:
         #     torch.cuda.empty_cache()
@@ -240,10 +243,12 @@ class TrainManager:
                 reset_iter_state=train_config.get("reset_iter_state", False))
 
         # multi-gpu training (should be after apex fp16 initialization)
-        if self.n_gpu > 1:
+        if self.n_gpu > 1 and not self.ddp:
             self.model = _DataParallel(self.model)
+        self.train_sampler = None
+        self.batch_sampler = None
 
-# class Decomment():
+    # class Decomment():
     def _save_checkpoint(self, new_best: bool = True) -> None:
         """
         Save the model's current parameters and the training state to a
@@ -381,10 +386,54 @@ class TrainManager:
         if self.fp16 and model_checkpoint.get("amp_state", None) is not None:
             amp.load_state_dict(model_checkpoint['amp_state'])
 
+    def make_small_data(self, data,
+                        small_data_size=30, small_epochs=2, batch_size_dividor=5):
+        logger.info(f"The lenght of small data is {small_data_size}")
+        self.batch_size = small_data_size // batch_size_dividor
+        self.epochs = small_epochs
+        self.validation_freq = 10000
+
+        subset_data, _ = torch.utils.data.random_split(data,
+                                                       [small_data_size, len(data) - small_data_size],
+                                                       torch.Generator().manual_seed(
+                                                           self.train_config.get("random_seed", 42)))
+        subset_data.src_vocab = data.src_vocab
+        subset_data.trg_vocab = data.trg_vocab
+        return subset_data
+
+
+    def init_ddp(self, gpu, train_data):
+        logger.info(f"Got into training, gpu is {gpu}")
+        print(f"Got into training, gpu is {gpu}")
+        self.rank = self.node_nr * self.n_gpu + gpu
+        dist.init_process_group(
+            backend='nccl',  # gloo
+            init_method='env://',
+            world_size=self.world_size,
+            rank=self.rank
+        )
+        self.device = torch.device(gpu)
+        print(self.device)
+        self.model.to(self.device)
+        self.model = _DistributedDataParallel(self.model, device_ids=[gpu])
+        logger.info(f"Model wrapped")
+
+        if self.distributed_batch_sampler:
+            self.batch_sampler = DistributedBatchSamplerSimilarLength(train_data, self.batch_size)
+        else:
+            self.train_sampler = torch.utils.data.distributed.DistributedSampler(
+                train_data,
+                num_replicas=self.world_size,
+                rank=self.rank
+            )
+
+        if self.rank == 0:
+            self.tb_writer = SummaryWriter(log_dir=self.model_dir + "/tensorboard/")
+
     # pylint: disable=unnecessary-comprehension
     # pylint: disable=too-many-branches
     # pylint: disable=too-many-statements
-    def train_and_validate(self, gpu: int=0, train_data: Dataset = None, valid_data: Dataset = None) \
+    def train_and_validate(self, gpu: int = 0, train_data: Dataset = None, valid_data: Dataset = None) \
             -> None:
         """
         Train the model and validate it from time to time on the validation set.
@@ -392,55 +441,27 @@ class TrainManager:
         :param train_data: training data
         :param valid_data: validation data
         """
-        print("!!!!!")
+        logger.info(f'gpu {gpu}')
+        print(f'gpu {gpu}')
         logger.info("Initialised")
         # if small test run, use subset of the data that is one batch
         if self.small_test_run:
-            SMALL_DATA_SIZE = 6
-            train_subset_data, _ = torch.utils.data.random_split(train_data,
-                                                                 [SMALL_DATA_SIZE, len(train_data) - SMALL_DATA_SIZE],
-                                                                 torch.Generator().manual_seed(
-                                                                     self.train_config.get("random_seed", 42)))
-            train_subset_data.src_vocab = train_data.src_vocab
-            train_subset_data.trg_vocab = train_data.trg_vocab
-            train_data = train_subset_data
-            logger.info(f"The lenght of data is {SMALL_DATA_SIZE}")
-            self.batch_size = SMALL_DATA_SIZE
-            self.epochs = 2
-            self.validation_freq = 10000
+            train_data = self.make_small_data(train_data)
+
         # if Distributed Data Parallel
         if self.ddp:
-            logger.info(f"Got into training, gpu is {gpu}")
-            # todo pass arguments to make sure it works with multinode training
-            gpu = gpu
-            world_size = 2
-            rank = gpu
-            dist.init_process_group(
-                backend='gloo', #nccl
-                init_method='env://',
-                world_size=world_size,
-                rank=rank
-            )
-            logger.info(f"Process group initialised")
-
-            self.model = DDP(self.model.to(gpu), device_ids=[gpu])
-            logger.info(f"Model wrapped")
-
-            train_sampler = torch.utils.data.distributed.DistributedSampler(
-                train_dataset,
-                num_replicas=world_size,
-                rank=rank
-            )
-            self.batch.device = gpu
+            self.init_ddp(gpu, train_data)
         else:
-            train_sampler = None
+            self.batch_sampler = BatchSamplerSimilarLength(train_data, self.batch_size, shuffle=self.shuffle)
+            self.tb_writer = SummaryWriter(log_dir=self.model_dir + "/tensorboard/")
 
         self.dataloader = make_dataloader(train_data,
                                           batch_size=self.batch_size,
                                           batch_type=self.batch_type,
                                           train=True,
-                                          shuffle=self.shuffle if train_sampler is None else False,
-                                          sampler=train_sampler)
+                                          shuffle=self.shuffle if self.train_sampler is None else False,
+                                          sampler=self.train_sampler,
+                                          batch_sampler=self.batch_sampler)
 
         #################################################################
         # simplify accumulation logic:
@@ -501,12 +522,13 @@ class TrainManager:
             batch_loss = 0
             self.epoch_no = epoch_no
             if self.ddp:
-                train_sampler.set_epoch(self.epoch_no)
+                self.train_sampler.set_epoch(self.epoch_no)
 
             for i, batch in enumerate(self.dataloader):
+                print(batch[1], batch[-1])
                 # create a Batch object from torch batch
                 batch = self.batch_class(batch, self.model.pad_index,
-                                         use_cuda=self.use_cuda)
+                                         use_cuda=self.use_cuda, device=self.device)
                 # print(batch.src.shape, batch.src_length)
 
                 # get batch loss
@@ -538,8 +560,14 @@ class TrainManager:
 
                     # log learning progress
                     if self.stats.steps % self.logging_freq == 0:
-                        self.tb_writer.add_scalar("train/train_batch_loss",
-                                                  batch_loss, self.stats.steps)
+                        if not self.ddp or self.rank == 0:
+                            self.tb_writer.add_scalar("train/train_batch_loss",
+                                                      batch_loss, self.stats.steps)
+                            if self.stats.utility_term is not None:
+                                self.tb_writer.add_scalar("train/train_utility_term_loss",
+                                                          self.stats.utility_term, self.stats.steps)
+                                self.tb_writer.add_histogram("train/utilities_histogram", self.stats.u_h,
+                                                             self.stats.steps)
                         elapsed = time.time() - start - total_valid_duration
                         elapsed_tokens = self.stats.total_tokens - start_tokens
                         logger.info(
@@ -571,7 +599,7 @@ class TrainManager:
 
             else:
                 epoch_duration = time.time() - start - total_valid_duration + epoch_duration
-                logger.info(f"End of epoch {epoch_no + 1}, it took {epoch_duration:.3f}. Epoch loss is {epoch_loss}")
+                logger.info(f"End of epoch {epoch_no + 1}, it took {epoch_duration:.3f}. Epoch loss is {epoch_loss:.4f}")
             # validate at the end of epoch if small
             if self.small_test_run:
                 valid_duration = self._validate(valid_data, epoch_no)
@@ -592,8 +620,8 @@ class TrainManager:
         logger.info('Best validation result (greedy) at step %8d: %6.2f %s.',
                     self.stats.best_ckpt_iter, self.stats.best_ckpt_score,
                     self.early_stopping_metric)
-
-        self.tb_writer.close()  # close Tensorboard writer
+        if not self.ddp or self.rank == 0:
+            self.tb_writer.close()  # close Tensorboard writer
 
     def _train_step(self, batch: Batch) -> Tensor:
         """
@@ -605,9 +633,10 @@ class TrainManager:
         # reactivate training
         self.model.train()
         # get loss
-        batch_loss, _, _, _ = self.model(return_type="loss",
-                                         **{"batch": batch, "utility_regularising": self.utility_regularising,
-                                            **vars(batch)})
+        batch_loss, utility_term, u_h, _ = self.model(return_type="loss",
+                                                      **{"batch": batch,
+                                                         "utility_regularising": self.utility_regularising,
+                                                         **vars(batch)})
 
         # sum multi-gpu losses
         if self.n_gpu > 1:
@@ -642,6 +671,8 @@ class TrainManager:
         # increment token counter
         self.stats.total_tokens += batch.ntokens
 
+        self.stats.utility_term = utility_term
+        self.stats.u_h = u_h
         return norm_batch_loss.item()
 
     def _validate(self, valid_data, epoch_no, track_mbr=False):
@@ -669,13 +700,13 @@ class TrainManager:
                 mbr=True if track_mbr else False,
                 utility_type=self.utility_type
             )
-
-        self.tb_writer.add_scalar("valid/valid_loss", valid_loss,
-                                  self.stats.steps)
-        self.tb_writer.add_scalar("valid/valid_score", valid_score,
-                                  self.stats.steps)
-        self.tb_writer.add_scalar("valid/valid_ppl", valid_ppl,
-                                  self.stats.steps)
+        if not self.ddp or self.rank == 0:
+            self.tb_writer.add_scalar("valid/valid_loss", valid_loss,
+                                      self.stats.steps)
+            self.tb_writer.add_scalar("valid/valid_score", valid_score,
+                                      self.stats.steps)
+            self.tb_writer.add_scalar("valid/valid_ppl", valid_ppl,
+                                      self.stats.steps)
 
         if self.early_stopping_metric == "loss":
             ckpt_score = valid_loss
@@ -861,6 +892,10 @@ class TrainManager:
             # minimize or maximize score
             self.minimize_metric = minimize_metric
 
+            # temporary holders for stats
+            self.utility_term = None
+            self.u_h = None
+
         def is_best(self, score):
             if self.minimize_metric:
                 is_best = score < self.best_ckpt_score
@@ -892,7 +927,9 @@ def train(cfg_file: str) -> None:
         train_data, dev_data, test_data, src_vocab, trg_vocab = load_data(
             data_cfg=cfg["data"])
     else:
-        train_data, dev_data, test_data = [(['1', '2'], ['1', '2']), (['1', '2'], ['1', '2'])]*3
+        train_data, dev_data, test_data = (['1', '2', '1', '2'], ['1', '2', '1', '2']), \
+                                          (['1', '2', '1', '2'], ['1', '2', '1', '2']), \
+                                          (['1', '2', '1', '2'], ['1', '2', '1', '2'])
         src_vocab = build_vocab(language="src", min_freq=0, max_size=2,
                                 dataset=train_data)
         trg_vocab = build_vocab(language="trg", min_freq=0, max_size=2,
@@ -923,13 +960,13 @@ def train(cfg_file: str) -> None:
     src_vocab.to_file(src_vocab_file)
     trg_vocab_file = "{}/trg_vocab.txt".format(cfg["training"]["model_dir"])
     trg_vocab.to_file(trg_vocab_file)
-    if not cfg["training"].get("ddp", False):
-        # train the model
-        trainer.train_and_validate(train_data=train_data, valid_data=dev_data)
-    else:
-        # b = pickle.dumps(trainer)
-        # logger.info("Pickling success")
+    # train the model
+    if cfg["training"].get("ddp", False) and trainer.n_gpu > 0:
+        b = pickle.dumps(trainer)
+        logger.info("Training using multiple GPUs")
         spawn_multiprocess(trainer.train_and_validate, (train_data, dev_data))
+    else:
+        trainer.train_and_validate(train_data=train_data, valid_data=dev_data)
 
     # predict with the best model on validation and test
     # (if test data is available)
@@ -948,14 +985,13 @@ def train(cfg_file: str) -> None:
          datasets=datasets_to_test)
 
 
-def spawn_multiprocess(train_fn, args, num_gpus=2, num_nodes=1):
-    # args.world_size = num_gpus * num_nodes
+def spawn_multiprocess(train_fn, args):
+    num_gpus = torch.cuda.device_count()
+    # world_size = num_gpus * num_nodes
     os.environ['MASTER_ADDR'] = '127.0.0.1'  # lisa IP
-    os.environ['MASTER_PORT'] = '9028' #29500
-    # os.environ['MKL_SERVICE_FORCE_INTEL']='1'
-    # os.environ['MKL_THREADING_LAYER']='GNU'
-    logger.info("Spawning multiple GPUs")
-    mp.spawn(train_fn, nprocs=num_gpus, args=args, join=True)
+    os.environ['MASTER_PORT'] = '9028'
+    # os.environ['MKL_THREADING_LAYER']='GNU' # if numpy<=20.1
+    mp.spawn(train_fn, nprocs=num_gpus, args=args)
     logger.info("Multiple GPUs are done")
 
 
