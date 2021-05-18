@@ -20,8 +20,7 @@ from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 import torch.multiprocessing as mp
 import torch.distributed as dist
-
-from torchtext.legacy.data import Dataset
+from torch.utils.data import Dataset
 
 from joeynmt.model import build_model
 from joeynmt.batch import Batch
@@ -91,16 +90,24 @@ class TrainManager:
         self.model = model
         self._log_parameters_list()
 
+        # generation
+        self.max_output_length = train_config.get("max_output_length", None)
+
         # objective
         self.utility_regularising = train_config.get("utility_regularising", False)
-        self.utility_alpha = train_config.get("utility_alpha", 1)
+        self._utility_alpha = train_config.get("utility_alpha", 1)
         self.label_smoothing = train_config.get("label_smoothing", 0.0)
-        self.num_samples = train_config.get("num_samples", 10)
+        self._num_samples = train_config.get("num_samples", 10)
+        self._mean_baseline = train_config.get("mean_baseline", False)
 
-        self.model._utility_alpha = self.utility_alpha
-        self.model._num_samples = self.num_samples
+        # self.model._utility_alpha = self.utility_alpha
+        # self.model._num_samples = self.num_samples
         self.model.loss_function = XentLoss(pad_index=self.model.pad_index,
-                                            smoothing=self.label_smoothing)
+                                            smoothing=self.label_smoothing,
+                                            utility_alpha=self._utility_alpha,
+                                            num_samples=self._num_samples,
+                                            max_output_length=self.max_output_length,
+                                            mean_baseline=self._mean_baseline)
         self.normalization = train_config.get("normalization", "batch")
         if self.normalization not in ["batch", "tokens", "none"]:
             raise ConfigurationError("Invalid normalization option."
@@ -191,14 +198,10 @@ class TrainManager:
 
         self.batch_multiplier = train_config.get("batch_multiplier", 1)
 
-        # generation
-        self.max_output_length = train_config.get("max_output_length", None)
-        self.model._max_output_length = self.max_output_length
-
         # CPU / GPU
         self.use_cuda = train_config["use_cuda"] and torch.cuda.is_available()
         self.n_gpu = torch.cuda.device_count() if self.use_cuda else 0
-        logger.info(f"NUMBER OF GPUS IS {self.n_gpu}{'!'*100}")
+        logger.info(f"NUMBER OF GPUS IS {self.n_gpu}{'!' * 100}")
         self.device = torch.device("cuda" if self.use_cuda else "cpu")
         self.ddp = train_config.get("ddp", False)
         self.num_nodes = train_config.get("num_nodes", 1)
@@ -401,7 +404,6 @@ class TrainManager:
         subset_data.trg_vocab = data.trg_vocab
         return subset_data
 
-
     def init_ddp(self, gpu, train_data):
         logger.info(f"Got into training, gpu is {gpu}")
         print(f"Got into training, gpu is {gpu}")
@@ -599,7 +601,8 @@ class TrainManager:
 
             else:
                 epoch_duration = time.time() - start - total_valid_duration + epoch_duration
-                logger.info(f"End of epoch {epoch_no + 1}, it took {epoch_duration:.3f}. Epoch loss is {epoch_loss:.4f}")
+                logger.info(
+                    f"End of epoch {epoch_no + 1}, it took {epoch_duration:.3f}. Epoch loss is {epoch_loss:.4f}")
             # validate at the end of epoch if small
             if self.small_test_run:
                 valid_duration = self._validate(valid_data, epoch_no)

@@ -8,12 +8,14 @@ from torch import nn, Tensor
 from torch.autograd import Variable
 from joeynmt.prediction import mbr_decoding
 
+
 class XentLoss(nn.Module):
     """
     Cross-Entropy Loss with optional label smoothing
     """
 
-    def __init__(self, pad_index: int, smoothing: float = 0.0, utility_regularising=False):
+    def __init__(self, pad_index: int, smoothing: float = 0.0, utility_alpha=0,
+                 num_samples=1, max_output_length=100, mean_baseline=False):
         super().__init__()
         self.smoothing = smoothing
         self.pad_index = pad_index
@@ -21,10 +23,64 @@ class XentLoss(nn.Module):
             # standard xent loss
             self.criterion = nn.NLLLoss(ignore_index=self.pad_index,
                                         reduction='sum')
-        else: # reguralizing
+        else:  # reguralizing
             # custom label-smoothed loss, computed with KL divergence loss
             self.criterion = nn.KLDivLoss(reduction='sum')
-        self.utility_regularising = utility_regularising
+
+        self.utility_alpha = utility_alpha  # set by the TrainManager
+        self.num_samples = num_samples  # set by the TrainManager
+        self.max_output_length = None  # set by the TrainManager
+        self._utility_running_average = 0
+        self._utility_step = 0
+        self.mean_baseline = mean_baseline
+        self.vimco_baseline = True
+
+    def utility_loss(self, model, batch, batch_loss):
+        # reinforce: \delta E = E_{p(y|\theta, x)} [log u(y,h) * \delta log p (y|\theta, x)]
+        from joeynmt.prediction import mbr_decoding
+        # compute mbr, get utility(samples, h)
+        # todo pass encode batch to save computations
+        u_h, sample_log_probs = mbr_decoding(model, batch, max_output_length=self.max_output_length,
+                                             num_samples=self.num_samples,
+                                             mbr_type="editdistance",
+                                             return_types=("utilities", "log_probabilities"),
+                                             need_grad=True, compute_log_probs=True,
+                                             encoded_batch=None)
+        # get log_u(samples,h) and detach for reinforce
+        log_uh = torch.log(u_h).detach()
+        print(f"log_uh shape {log_uh.shape}")
+        # if we use mean control variate, substract the current mean and then update the mean
+        if self.mean_baseline:
+            # new log utility is  log utility
+            mean_baseline = self._utility_running_average
+            self._utility_step += 1
+            self._utility_running_average += (torch.mean(
+                log_uh).item() - self._utility_running_average) / self._utility_step
+            log_uh = updated_log_uh
+        else:
+            mean_baseline = 0
+        if self.vimco_baseline:
+            total_utility = torch.sum(log_uh)
+            print(f"total_utility shape {total_utility.shape}")
+            utility_mean = total_utility - torch.log(log_uh.shape[0])
+            sum_min_i = total_utility - log_uh - torch.log(log_uh.shape[0] - 1)
+            print(f"sum_min_shape {sum_min_i.shape}")
+            vimco_baseline =sum_min_i # utility_mean -
+        else:
+            vimco_baseline = 0
+        log_uh = log_uh - mean_baseline - vimco_baseline
+        utility_term = torch.mean(log_uh.to(sample_log_probs.device) * sample_log_probs)
+        if torch.isinf(utility_term).any():
+            logger.info("INF UTILITY" * 100)
+            logger.info(f"log_uh is inf? {torch.isinf(log_uh).any()}")
+            logger.info(f"sample_log_probs is inf? {torch.isinf(sample_log_probs).any()}")
+
+        if torch.isinf(batch_loss).any():
+            logger.info("INF batch loss")
+
+        batch_loss += utility_term * self.utility_alpha
+        utility_term = utility_term.item()
+        return batch_loss, utility_term, u_h
 
     def _smooth_targets(self, targets: Tensor, vocab_size: int):
         """
@@ -51,8 +107,8 @@ class XentLoss(nn.Module):
             smooth_dist.index_fill_(0, padding_positions.squeeze(), 0.0)
         return Variable(smooth_dist, requires_grad=False)
 
+        # pylint: disable=arguments-differ
 
-    # pylint: disable=arguments-differ
     def forward(self, log_probs, targets):
         """
         Compute the cross-entropy between logits and targets.

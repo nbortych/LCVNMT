@@ -55,9 +55,6 @@ class Model(nn.Module):
         self.pad_index = self.trg_vocab.stoi[PAD_TOKEN]
         self.eos_index = self.trg_vocab.stoi[EOS_TOKEN]
         self._loss_function = None  # set by the TrainManager
-        self._utility_alpha = 1  # set by the TrainManager
-        self._num_samples = 10  # set by the TrainManager
-        self._max_output_length = None  # set by the TrainManager
 
     @property
     def loss_function(self):
@@ -103,33 +100,18 @@ class Model(nn.Module):
             log_probs = F.log_softmax(out, dim=-1)
             # compute batch loss
             batch_loss = self.loss_function(log_probs, kwargs["trg"])
-            utility_reg = kwargs.get("utility_regularising", False)  # self.loss_function.utility_regularising
+            utility_reg = kwargs.get("utility_regularising", False)
             if utility_reg:
-                # reinforce: \delta E = E_{p(y|\theta, x)} [log u(y,h) * \delta log p (y|\theta, x)]
-                from joeynmt.prediction import mbr_decoding
-                # compute mbr, get utility(samples, h)
-                u_h, sample_log_probs = mbr_decoding(self, kwargs["batch"], max_output_length=self._max_output_length,
-                                                     num_samples=self._num_samples,
-                                                     mbr_type="editdistance",
-                                                     return_types=("utilities", "log_probabilities"),
-                                                     need_grad=True, compute_log_probs=True,
-                                                     encoded_batch=None)
-                # get log_u(samples,h) and detach for reinforce
-                log_uh = torch.log(u_h).detach().to(sample_log_probs.device)
-                utility_term = torch.mean(log_uh * sample_log_probs)
-                if torch.isinf(utility_term).any():
-                    logger.info("INF UTILITY" * 100)
-                    logger.info(f"log_uh is inf? {torch.isinf(log_uh).any()}")
-                    logger.info(f"sample_log_probs is inf? {torch.isinf(sample_log_probs).any()}")
+                # todo pass encode batch to save computations
+                batch_loss, utility_term, u_h = self.loss_function.utility_loss(model=self, batch=kwargs['batch'],
+                                                                                batch_loss=batch_loss)
 
-                if torch.isinf(batch_loss).any():
-                    logger.info("INF batch loss")
-                # logger.info(f"Batch loss {batch_loss}, Utility term {utility_term}")
-                batch_loss += utility_term * self._utility_alpha
+            else:
+                utility_term, u_h = None, None
 
             # return batch loss
             #     = sum over all elements in batch that are not pad
-            return_tuple = (batch_loss, None, None, None)
+            return_tuple = (batch_loss, utility_term, u_h, None)
 
         elif return_type == "encode":
             encoder_output, encoder_hidden = self._encode(**kwargs)
@@ -231,6 +213,16 @@ class Model(nn.Module):
 
 class _DataParallel(nn.DataParallel):
     """ DataParallel wrapper to pass through the model attributes """
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.module, name)
+
+
+class _DistributedDataParallel(nn.parallel.DistributedDataParallel):
+    """ DistributedDataParallel wrapper to pass through the model attributes """
 
     def __getattr__(self, name):
         try:

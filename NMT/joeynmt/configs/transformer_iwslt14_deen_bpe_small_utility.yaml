@@ -61,6 +61,7 @@ training:
   skip_vocab: False
   num_nodes: 1
   distributed_batch_sampler: False
+  mean_baseline: True
 
 model:
   initializer: "xavier"
