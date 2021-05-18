@@ -109,8 +109,6 @@ class Model(nn.Module):
             else:
                 utility_term, u_h = None, None
 
-            # return batch loss
-            #     = sum over all elements in batch that are not pad
             return_tuple = (batch_loss, utility_term, u_h, None)
 
         elif return_type == "encode":

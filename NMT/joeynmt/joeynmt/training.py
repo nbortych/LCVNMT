@@ -99,6 +99,7 @@ class TrainManager:
         self.label_smoothing = train_config.get("label_smoothing", 0.0)
         self._num_samples = train_config.get("num_samples", 10)
         self._mean_baseline = train_config.get("mean_baseline", False)
+        self._vimco_baseline = train_config.get("vimco_baseline", False)
 
         # self.model._utility_alpha = self.utility_alpha
         # self.model._num_samples = self.num_samples
@@ -107,7 +108,8 @@ class TrainManager:
                                             utility_alpha=self._utility_alpha,
                                             num_samples=self._num_samples,
                                             max_output_length=self.max_output_length,
-                                            mean_baseline=self._mean_baseline)
+                                            mean_baseline=self._mean_baseline,
+                                            vimco_baseline = self._vimco_baseline)
         self.normalization = train_config.get("normalization", "batch")
         if self.normalization not in ["batch", "tokens", "none"]:
             raise ConfigurationError("Invalid normalization option."
@@ -942,8 +944,6 @@ def train(cfg_file: str) -> None:
 
     # for training management, e.g. early stopping and model selection
     trainer = TrainManager(model=model, config=cfg)
-    # todo decomment
-    # trainer.tb_writer = SummaryWriter(log_dir=model_dir + "/tensorboard/")
     # store copy of original training config in model dir
     shutil.copy2(cfg_file, model_dir + "/config.yaml")
 

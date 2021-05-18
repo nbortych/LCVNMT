@@ -4,6 +4,8 @@ Module to implement training loss
 """
 
 import torch
+from math import log
+
 from torch import nn, Tensor
 from torch.autograd import Variable
 from joeynmt.prediction import mbr_decoding
@@ -14,8 +16,8 @@ class XentLoss(nn.Module):
     Cross-Entropy Loss with optional label smoothing
     """
 
-    def __init__(self, pad_index: int, smoothing: float = 0.0, utility_alpha=0,
-                 num_samples=1, max_output_length=100, mean_baseline=False):
+    def __init__(self, pad_index: int, smoothing: float = 0.0, utility_alpha=1, num_samples=1,
+                 max_output_length=100, mean_baseline=False, vimco_baseline=False):
         super().__init__()
         self.smoothing = smoothing
         self.pad_index = pad_index
@@ -26,14 +28,18 @@ class XentLoss(nn.Module):
         else:  # reguralizing
             # custom label-smoothed loss, computed with KL divergence loss
             self.criterion = nn.KLDivLoss(reduction='sum')
-
-        self.utility_alpha = utility_alpha  # set by the TrainManager
-        self.num_samples = num_samples  # set by the TrainManager
-        self.max_output_length = None  # set by the TrainManager
+        # regularisation strength
+        self.utility_alpha = utility_alpha
+        # number of samples to compute the utility reg
+        self.num_samples = num_samples
+        # maximum sentece length in a sample
+        self.max_output_length = max_output_length
+        # which variance reduction baselines to use for REINFORCE
+        self.mean_baseline = mean_baseline
+        self.vimco_baseline = vimco_baseline
+        # running average container for the mean baseline
         self._utility_running_average = 0
         self._utility_step = 0
-        self.mean_baseline = mean_baseline
-        self.vimco_baseline = True
 
     def utility_loss(self, model, batch, batch_loss):
         # reinforce: \delta E = E_{p(y|\theta, x)} [log u(y,h) * \delta log p (y|\theta, x)]
@@ -46,40 +52,49 @@ class XentLoss(nn.Module):
                                              return_types=("utilities", "log_probabilities"),
                                              need_grad=True, compute_log_probs=True,
                                              encoded_batch=None)
-        # get log_u(samples,h) and detach for reinforce
+
         log_uh = torch.log(u_h).detach()
-        print(f"log_uh shape {log_uh.shape}")
+
         # if we use mean control variate, substract the current mean and then update the mean
         if self.mean_baseline:
             # new log utility is  log utility
             mean_baseline = self._utility_running_average
+            # update running mean += (utility_sample_mean - running mean)/N
             self._utility_step += 1
-            self._utility_running_average += (torch.mean(
-                log_uh).item() - self._utility_running_average) / self._utility_step
-            log_uh = updated_log_uh
+            self._utility_running_average += (torch.mean(log_uh).item() - self._utility_running_average) \
+                                             / self._utility_step
         else:
             mean_baseline = 0
+        # VIMCO control variate from arxiv.org/pdf/1602.06725.pdf
+        # vimco_baseline_j = log (\sum_i^{-j} u_i + mean^{-j}) -logS
+        # todo maybe log sum exp + log sub exp ?
+        # todo look into beer range
         if self.vimco_baseline:
-            total_utility = torch.sum(log_uh)
-            print(f"total_utility shape {total_utility.shape}")
-            utility_mean = total_utility - torch.log(log_uh.shape[0])
-            sum_min_i = total_utility - log_uh - torch.log(log_uh.shape[0] - 1)
-            print(f"sum_min_shape {sum_min_i.shape}")
-            vimco_baseline =sum_min_i # utility_mean -
+            # get all the utilities in the sample[B]
+            total_utility = torch.sum(log_uh, dim=1)
+            # substract the jth element at the jth index [B,S]
+            sum_min_j = total_utility.unsqueeze(-1) - log_uh
+            # get the mean without the jth
+            mean_min_j = sum_min_j - log(self.num_samples - 1)
+            # baseline is the sum without the jth + mean without the jth
+            vimco_baseline = sum_min_j + mean_min_j - log(self.num_samples)
         else:
             vimco_baseline = 0
+        # substract the baseline
         log_uh = log_uh - mean_baseline - vimco_baseline
+        # compute mean of U(y,h) * \grad p(y)
         utility_term = torch.mean(log_uh.to(sample_log_probs.device) * sample_log_probs)
-        if torch.isinf(utility_term).any():
-            logger.info("INF UTILITY" * 100)
-            logger.info(f"log_uh is inf? {torch.isinf(log_uh).any()}")
-            logger.info(f"sample_log_probs is inf? {torch.isinf(sample_log_probs).any()}")
-
-        if torch.isinf(batch_loss).any():
-            logger.info("INF batch loss")
-
+        # if torch.isinf(utility_term).any():
+        #     logger.info("INF UTILITY" * 100)
+        #     logger.info(f"log_uh is inf? {torch.isinf(log_uh).any()}")
+        #     logger.info(f"sample_log_probs is inf? {torch.isinf(sample_log_probs).any()}")
+        #
+        # if torch.isinf(batch_loss).any():
+        #     logger.info("INF batch loss")
+        # add to the batch loss
         batch_loss += utility_term * self.utility_alpha
         utility_term = utility_term.item()
+
         return batch_loss, utility_term, u_h
 
     def _smooth_targets(self, targets: Tensor, vocab_size: int):

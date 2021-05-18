@@ -603,7 +603,7 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
     batch.src = batch.src.repeat(num_samples, 1)
     batch.src_mask = batch.src_mask.repeat(num_samples, 1, 1)
     batch.trg_mask = batch.trg_mask.repeat(num_samples, 1, 1)
-    logger.info(f" batch device in mbr {batch.src.device}")
+    # logger.info(f" batch device in mbr {batch.src.device}")
     # [B*SxL, B*S]
     samples, log_probs = run_batch(model, batch, max_output_length=max_output_length, beam_size=1, beam_alpha=1,
                                    sample=True, need_grad=need_grad, compute_log_probs=compute_log_probs,
@@ -651,7 +651,8 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
             return_list.append(samples)
         if "utilities" in return_types:
             best_idx = best_idx.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, num_samples)
-            u_h = U.gather(1, best_idx).squeeze(-1)
+            # [BxS]
+            u_h = U.gather(1, best_idx).squeeze(1)
             u_h = u_h + 1e-10
             return_list.append(u_h)
         if "log_probabilities" in return_types:

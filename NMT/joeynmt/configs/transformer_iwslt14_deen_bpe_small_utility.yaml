@@ -55,13 +55,14 @@ training:
   utility: "editdistance"
   small_test_run: True
   utility_regularising: True
-  utility_alpha: 0.1
+  utility_alpha: 1
   num_samples: 2
   ddp: False
   skip_vocab: False
   num_nodes: 1
   distributed_batch_sampler: False
   mean_baseline: True
+  vimco_baseline: True
 
 model:
   initializer: "xavier"
