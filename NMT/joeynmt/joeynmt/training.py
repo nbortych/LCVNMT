@@ -20,6 +20,7 @@ from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 import torch.multiprocessing as mp
 import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import Dataset
 
 from joeynmt.model import build_model
@@ -50,6 +51,7 @@ except ImportError as no_apex:
     # error handling in TrainManager object construction
     pass
 
+# logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -109,7 +111,7 @@ class TrainManager:
                                             num_samples=self._num_samples,
                                             max_output_length=self.max_output_length,
                                             mean_baseline=self._mean_baseline,
-                                            vimco_baseline = self._vimco_baseline)
+                                            vimco_baseline=self._vimco_baseline)
         self.normalization = train_config.get("normalization", "batch")
         if self.normalization not in ["batch", "tokens", "none"]:
             raise ConfigurationError("Invalid normalization option."
@@ -206,11 +208,12 @@ class TrainManager:
         logger.info(f"NUMBER OF GPUS IS {self.n_gpu}{'!' * 100}")
         self.device = torch.device("cuda" if self.use_cuda else "cpu")
         self.ddp = train_config.get("ddp", False)
+        self.model.ddp = self.ddp
         self.num_nodes = train_config.get("num_nodes", 1)
         self.node_nr = train_config.get("node_nr", 0)
         self.world_size = self.num_nodes * self.n_gpu
         self.distributed_batch_sampler = train_config.get("distributed_batch_sampler", False)
-
+        self.child_conn = None # set by child process in case of ddp
         # if self.use_cuda:
         #     torch.cuda.empty_cache()
         if self.use_cuda and not self.ddp:
@@ -253,7 +256,6 @@ class TrainManager:
         self.train_sampler = None
         self.batch_sampler = None
 
-    # class Decomment():
     def _save_checkpoint(self, new_best: bool = True) -> None:
         """
         Save the model's current parameters and the training state to a
@@ -406,7 +408,7 @@ class TrainManager:
         subset_data.trg_vocab = data.trg_vocab
         return subset_data
 
-    def init_ddp(self, gpu, train_data):
+    def init_ddp(self, gpu, train_data, child_conn):
         logger.info(f"Got into training, gpu is {gpu}")
         print(f"Got into training, gpu is {gpu}")
         self.rank = self.node_nr * self.n_gpu + gpu
@@ -417,7 +419,6 @@ class TrainManager:
             rank=self.rank
         )
         self.device = torch.device(gpu)
-        print(self.device)
         self.model.to(self.device)
         self.model = _DistributedDataParallel(self.model, device_ids=[gpu])
         logger.info(f"Model wrapped")
@@ -425,19 +426,16 @@ class TrainManager:
         if self.distributed_batch_sampler:
             self.batch_sampler = DistributedBatchSamplerSimilarLength(train_data, self.batch_size)
         else:
-            self.train_sampler = torch.utils.data.distributed.DistributedSampler(
-                train_data,
-                num_replicas=self.world_size,
-                rank=self.rank
-            )
+            self.train_sampler = DistributedSampler(train_data, num_replicas=self.world_size,
+                                                    rank=self.rank)
 
         if self.rank == 0:
             self.tb_writer = SummaryWriter(log_dir=self.model_dir + "/tensorboard/")
-
+        self.child_conn = child_conn
     # pylint: disable=unnecessary-comprehension
     # pylint: disable=too-many-branches
     # pylint: disable=too-many-statements
-    def train_and_validate(self, gpu: int = 0, train_data: Dataset = None, valid_data: Dataset = None) \
+    def train_and_validate(self, gpu: int = 0, train_data: Dataset = None, valid_data: Dataset = None, child_conn = None) \
             -> None:
         """
         Train the model and validate it from time to time on the validation set.
@@ -454,7 +452,8 @@ class TrainManager:
 
         # if Distributed Data Parallel
         if self.ddp:
-            self.init_ddp(gpu, train_data)
+            self.init_ddp(gpu, train_data, child_conn)
+            logger = logging.getLogger(__name__)
         else:
             self.batch_sampler = BatchSamplerSimilarLength(train_data, self.batch_size, shuffle=self.shuffle)
             self.tb_writer = SummaryWriter(log_dir=self.model_dir + "/tensorboard/")
@@ -644,7 +643,7 @@ class TrainManager:
                                                          **vars(batch)})
 
         # sum multi-gpu losses
-        if self.n_gpu > 1:
+        if self.n_gpu > 1 and not self.ddp:
             batch_loss = batch_loss.sum()
 
         # normalize batch loss
@@ -703,7 +702,9 @@ class TrainManager:
                 n_gpu=self.n_gpu,
                 small_test_run=self.small_test_run,
                 mbr=True if track_mbr else False,
-                utility_type=self.utility_type
+                utility_type=self.utility_type,
+                rank=self.rank,
+                world_size=self.world_size
             )
         if not self.ddp or self.rank == 0:
             self.tb_writer.add_scalar("valid/valid_loss", valid_loss,
@@ -725,7 +726,7 @@ class TrainManager:
             self.scheduler.step(ckpt_score)
 
         new_best = False
-        if self.stats.is_best(ckpt_score):
+        if self.stats.is_best(ckpt_score) and (not self.ddp or self.rank == 0):
             self.stats.best_ckpt_score = ckpt_score
             self.stats.best_ckpt_iter = self.stats.steps
             logger.info('Hooray! New best validation result [%s]!',
@@ -734,7 +735,9 @@ class TrainManager:
                 logger.info("Saving new checkpoint.")
                 new_best = True
                 self._save_checkpoint(new_best)
-        elif self.save_latest_checkpoint:
+                if self.child_conn is not None:
+                    self.child_conn.send(self.stats.best_ckpt_iter)
+        elif self.save_latest_checkpoint and (not self.ddp or self.rank == 0):
             self._save_checkpoint(new_best)
 
         # append to validation report
@@ -965,9 +968,12 @@ def train(cfg_file: str) -> None:
     trg_vocab.to_file(trg_vocab_file)
     # train the model
     if cfg["training"].get("ddp", False) and trainer.n_gpu > 0:
-        b = pickle.dumps(trainer)
+        parent_conn, child_conn = mp.Pipe()
         logger.info("Training using multiple GPUs")
-        spawn_multiprocess(trainer.train_and_validate, (train_data, dev_data))
+        spawn_multiprocess(trainer.train_and_validate, (train_data, dev_data, child_conn))
+        last_checkpoint =  parent_conn.recv()
+        print("Parent connection got",last_checkpoint)
+        trainer.stats.best_ckpt_iter = last_checkpoint
     else:
         trainer.train_and_validate(train_data=train_data, valid_data=dev_data)
 
@@ -982,13 +988,14 @@ def train(cfg_file: str) -> None:
         "src_vocab": src_vocab,
         "trg_vocab": trg_vocab
     }
+    print("checkpoint name", ckpt)
     test(cfg_file,
          ckpt=ckpt,
          output_path=output_path,
          datasets=datasets_to_test)
 
 
-def spawn_multiprocess(train_fn, args):
+def spawn_multiprocess(train_fn, args, child_conn):
     num_gpus = torch.cuda.device_count()
     # world_size = num_gpus * num_nodes
     os.environ['MASTER_ADDR'] = '127.0.0.1'  # lisa IP
