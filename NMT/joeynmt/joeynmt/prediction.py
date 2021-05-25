@@ -12,7 +12,9 @@ import editdistance
 
 import numpy as np
 import torch
-from torchtext.legacy.data import Dataset, Field
+from torchtext.legacy.data import Field
+from torch.utils.data import Dataset, Subset
+# from torch.utils.data.distributed import DistributedSampler
 
 from joeynmt.helpers import bpe_postprocess, load_config, make_logger, \
     get_latest_checkpoint, load_checkpoint, store_attention_plots
@@ -20,7 +22,7 @@ from joeynmt.metrics import bleu, chrf, token_accuracy, sequence_accuracy
 from joeynmt.model import build_model, Model, _DataParallel
 from joeynmt.search import run_batch
 from joeynmt.batch import Batch
-from joeynmt.data import load_data, make_dataloader, MonoDataset
+from joeynmt.data import load_data, make_dataloader, MonoDataset, DistributedEvalSampler
 from joeynmt.constants import UNK_TOKEN, PAD_TOKEN, EOS_TOKEN
 from joeynmt.vocabulary import Vocabulary
 
@@ -52,7 +54,9 @@ def validate_on_data(model: Model, data: Dataset,
                      small_test_run: bool = False,
                      num_samples: int = 10,
                      save_utility_per_sentence: bool = False,
-                     utility_type=None) \
+                     utility_type=None,
+                     rank=0,
+                     world_size=1) \
         -> (float, float, float, List[str], List[List[str]], List[str],
             List[str], List[List[str]], List[np.array]):
     """
@@ -115,11 +119,16 @@ def validate_on_data(model: Model, data: Dataset,
         data = val_subset_data
         logger.info(f"The lenght of validation data for small test run is {len(data)}")
         # batch_size = len(data)
+    if  model.ddp:
+        ddp_sampler = DistributedEvalSampler(data, num_replicas=world_size, rank=rank)
+        ddp_indices = ddp_sampler.indices
+    else:
+        ddp_sampler = None
 
     valid_dataloader = make_dataloader(
         dataset=data, batch_size=batch_size,
-        shuffle=False, train=False)
-    valid_sources_raw = [src for src,_, trg,_ in data]
+        shuffle=False, train=False, sampler=ddp_sampler)
+    valid_sources_raw = [src for src, _, trg, _ in data]
     pad_index = model.src_vocab.stoi[PAD_TOKEN]
     # disable dropout
     model.eval()
@@ -130,17 +139,18 @@ def validate_on_data(model: Model, data: Dataset,
         total_loss = 0
         total_ntokens = 0
         total_nseqs = 0
+        # gather subset of data
         for valid_batch in valid_dataloader:
             # run as during training to get validation loss (e.g. xent)
 
-            batch = batch_class(valid_batch, pad_index, use_cuda=use_cuda)
+            batch = batch_class(valid_batch, pad_index, use_cuda=use_cuda, device=model.device)
             # sort batch now by src length and keep track of order
             sort_reverse_index = batch.sort_by_src_length()
 
             # run as during training with teacher forcing
             if compute_loss and batch.trg is not None:
                 batch_loss, _, _, _ = model(return_type="loss", **{"batch": batch, **vars(batch)})
-                if n_gpu > 1:
+                if n_gpu > 1 and not model.ddp:
                     batch_loss = batch_loss.mean()  # average on multi-gpu
                 total_loss += batch_loss
                 total_ntokens += batch.ntokens
@@ -164,6 +174,9 @@ def validate_on_data(model: Model, data: Dataset,
                 attention_scores[sort_reverse_index]
                 if attention_scores is not None and type(attention_scores) != int else [])
 
+        # get only the data on the current gpu
+        if model.ddp:
+            data = Subset(data, indices=ddp_indices)
         assert len(all_outputs) == len(data)
 
         if compute_loss and total_ntokens > 0:
@@ -181,7 +194,7 @@ def validate_on_data(model: Model, data: Dataset,
 
         # evaluate with metric on full dataset
         join_char = " " if level in ["word", "bpe"] else ""
-        valid_sources_and_references = [(join_char.join(s), join_char.join(t)) for s,_, t,_ in data]
+        valid_sources_and_references = [(join_char.join(s), join_char.join(t)) for s, _, t, _ in data]
         valid_sources, valid_references = zip(*valid_sources_and_references)
         valid_hypotheses = [join_char.join(t) for t in decoded_valid]
 
@@ -209,6 +222,7 @@ def validate_on_data(model: Model, data: Dataset,
                                            remove_whitespace=sacrebleu["remove_whitespace"])
             elif eval_metric.lower() == 'token_accuracy':
                 current_valid_score = token_accuracy(  # supply List[List[str]]
+                    # todo remove data.trg
                     list(decoded_valid), list(data.trg))
             elif eval_metric.lower() == 'sequence_accuracy':
                 current_valid_score = sequence_accuracy(
