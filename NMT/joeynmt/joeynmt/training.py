@@ -14,6 +14,7 @@ import collections
 import pathlib
 import numpy as np
 import pickle
+import  copy
 
 import torch
 from torch import Tensor
@@ -51,7 +52,12 @@ except ImportError as no_apex:
     # error handling in TrainManager object construction
     pass
 
-# logging.basicConfig(level=logging.INFO)
+try:
+    import wandb
+except ImportError as no_wandb:
+    pass
+
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -69,6 +75,7 @@ class TrainManager:
         :param config: dictionary containing the training configurations
         :param batch_class: batch class to encapsulate the torch class
         """
+        self.config = copy.deepcopy(config)
         train_config = config["training"]
         self.train_config = train_config.copy()
         self.batch_class = batch_class
@@ -85,12 +92,19 @@ class TrainManager:
         self.logging_freq = train_config.get("logging_freq", 100)
         self.valid_report_file = "{}/validations.txt".format(self.model_dir)
         self.tb_writer = None  # set inside the training due to ddp
-
         self.save_latest_checkpoint = train_config.get("save_latest_ckpt", True)
+
+        # using wandb to log hyperparams + log results
+        self.use_wandb = train_config.get("wandb", False)
+
+
 
         # model
         self.model = model
         self._log_parameters_list()
+        # log gradients of the model to wandb
+        # if self.use_wandb:
+        #     wandb.watch(self.model, log_freq=1000)
 
         # generation
         self.max_output_length = train_config.get("max_output_length", None)
@@ -207,18 +221,27 @@ class TrainManager:
         self.n_gpu = torch.cuda.device_count() if self.use_cuda else 0
         logger.info(f"NUMBER OF GPUS IS {self.n_gpu}{'!' * 100}")
         self.device = torch.device("cuda" if self.use_cuda else "cpu")
-        self.ddp = train_config.get("ddp", False)
+        self.model.device = self.device
+        # DDP
+        # if there is no cuda available, do not use DDP
+        self.ddp = train_config.get("ddp", False) if self.use_cuda else False
         self.model.ddp = self.ddp
+        self.rank = None
         self.num_nodes = train_config.get("num_nodes", 1)
         self.node_nr = train_config.get("node_nr", 0)
         self.world_size = self.num_nodes * self.n_gpu
         self.distributed_batch_sampler = train_config.get("distributed_batch_sampler", False)
-        self.child_conn = None # set by child process in case of ddp
+        self.child_conn = None  # set by child process in case of ddp
         # if self.use_cuda:
         #     torch.cuda.empty_cache()
         if self.use_cuda and not self.ddp:
+            # do not put on device in case of ddp, since it will be put to specific devices
             self.model.to(self.device)
 
+        # if not ddp, initialise wandb here
+        if not self.ddp and self.use_wandb:
+            self.init_wandb(config)
+            wandb.watch(model)
         # fp16
         self.fp16 = train_config.get("fp16", False)
         if self.fp16:
@@ -256,6 +279,15 @@ class TrainManager:
         self.train_sampler = None
         self.batch_sampler = None
 
+    @staticmethod
+    def init_wandb(config):
+        if 'wandb' not in sys.modules:
+            raise ImportError("Please install wandb to log with it ") from no_wandb
+        with open('wandb_api_key.txt', 'r') as f:
+            api_key = f.readline()
+        wandb.login(key=api_key)
+        wandb.init(project="lcv-nmt", config=config)
+
     def _save_checkpoint(self, new_best: bool = True) -> None:
         """
         Save the model's current parameters and the training state to a
@@ -272,7 +304,8 @@ class TrainManager:
         model_path = os.path.join(self.model_dir,
                                   "{}.ckpt".format(self.stats.steps))
         model_state_dict = self.model.module.state_dict() \
-            if isinstance(self.model, torch.nn.DataParallel) \
+            if isinstance(self.model, torch.nn.DataParallel) or \
+               isinstance(self.model, torch.nn.parallel.DistributedDataParallel) \
             else self.model.state_dict()
         state = {
             "steps":
@@ -292,7 +325,9 @@ class TrainManager:
             'amp_state':
                 amp.state_dict() if self.fp16 else None,
             "epoch_no":
-                self.epoch_no
+                self.epoch_no,
+            'ddp':
+                self.ddp
         }
         torch.save(state, model_path)
         symlink_target = "{}.ckpt".format(self.stats.steps)
@@ -356,6 +391,7 @@ class TrainManager:
 
         # restore model and optimizer parameters
         self.model.load_state_dict(model_checkpoint["model_state"])
+        self.model.ddp = model_checkpoint["ddp"]
 
         if not reset_optimizer:
             self.optimizer.load_state_dict(model_checkpoint["optimizer_state"])
@@ -386,6 +422,7 @@ class TrainManager:
         # reset the epoch
         self.epoch_no = model_checkpoint['epoch_no']
         # move parameters to cuda
+        # todo if ddp do something
         if self.use_cuda:
             self.model.to(self.device)
 
@@ -431,11 +468,30 @@ class TrainManager:
 
         if self.rank == 0:
             self.tb_writer = SummaryWriter(log_dir=self.model_dir + "/tensorboard/")
+            if self.use_wandb:
+                self.init_wandb(self.config)
         self.child_conn = child_conn
-    # pylint: disable=unnecessary-comprehension
+
+    def _log_training(self,batch_loss):
+        # tensorflow
+        self.tb_writer.add_scalar("train/train_batch_loss",
+                                  batch_loss, self.stats.steps)
+        # wandb
+        if self.use_wandb:
+            wandb.log({"train/train_batch_loss": batch_loss})
+
+        if self.stats.utility_term is not None:
+            self.tb_writer.add_scalar("train/train_utility_term_loss",
+                                      self.stats.utility_term, self.stats.steps)
+            self.tb_writer.add_histogram("train/utilities_histogram", self.stats.u_h,
+                                         self.stats.steps)
+            if self.use_wandb:
+                wandb.log({"train/train_utility_term_loss":self.stats.utility_term, "train/utilities_histogram": wandb.Histogram(self.stats.u_h)})
+
+                # pylint: disable=unnecessary-comprehension
     # pylint: disable=too-many-branches
     # pylint: disable=too-many-statements
-    def train_and_validate(self, gpu: int = 0, train_data: Dataset = None, valid_data: Dataset = None, child_conn = None) \
+    def train_and_validate(self, gpu: int = 0, train_data: Dataset = None, valid_data: Dataset = None, child_conn=None) \
             -> None:
         """
         Train the model and validate it from time to time on the validation set.
@@ -453,7 +509,7 @@ class TrainManager:
         # if Distributed Data Parallel
         if self.ddp:
             self.init_ddp(gpu, train_data, child_conn)
-            logger = logging.getLogger(__name__)
+            # logger = logging.getLogger(__name__)
         else:
             self.batch_sampler = BatchSamplerSimilarLength(train_data, self.batch_size, shuffle=self.shuffle)
             self.tb_writer = SummaryWriter(log_dir=self.model_dir + "/tensorboard/")
@@ -524,8 +580,12 @@ class TrainManager:
             epoch_loss = 0
             batch_loss = 0
             self.epoch_no = epoch_no
+            # update the epoch so distributed can have a different order
             if self.ddp:
-                self.train_sampler.set_epoch(self.epoch_no)
+                if self.distributed_batch_sampler:
+                    self.batch_sampler.set_epoch(self.epoch_no)
+                else:
+                    self.train_sampler.set_epoch(self.epoch_no)
 
             for i, batch in enumerate(self.dataloader):
                 print(batch[1], batch[-1])
@@ -562,15 +622,11 @@ class TrainManager:
                     self.stats.steps += 1
 
                     # log learning progress
+                    # todo log more things here
                     if self.stats.steps % self.logging_freq == 0:
                         if not self.ddp or self.rank == 0:
-                            self.tb_writer.add_scalar("train/train_batch_loss",
-                                                      batch_loss, self.stats.steps)
-                            if self.stats.utility_term is not None:
-                                self.tb_writer.add_scalar("train/train_utility_term_loss",
-                                                          self.stats.utility_term, self.stats.steps)
-                                self.tb_writer.add_histogram("train/utilities_histogram", self.stats.u_h,
-                                                             self.stats.steps)
+                           self._log_training(batch_loss)
+
                         elapsed = time.time() - start - total_valid_duration
                         elapsed_tokens = self.stats.total_tokens - start_tokens
                         logger.info(
@@ -605,7 +661,7 @@ class TrainManager:
                 logger.info(
                     f"End of epoch {epoch_no + 1}, it took {epoch_duration:.3f}. Epoch loss is {epoch_loss:.4f}")
             # validate at the end of epoch if small
-            if self.small_test_run:
+            if self.small_test_run or True:
                 valid_duration = self._validate(valid_data, epoch_no)
                 if self.track_mbr:
                     mbr_valid_duration = self._validate(valid_data, epoch_no, True)
@@ -679,12 +735,44 @@ class TrainManager:
         self.stats.u_h = u_h
         return norm_batch_loss.item()
 
+    def _synch_reduce_ddp(self, score, reduce_type="mean"):
+        """
+        Synchronises validation scores between different gpus while doing DDP.
+        Args:
+            score (float/int): score to be synchronised.
+            reduce_type (str): how to reduce the score across the machine.
+                                One out of ["mean", "sum", "prod"]
+
+        Returns:
+            float representing the reduced score
+
+        """
+        valid_reduce_types = ["mean", "sum", "prod"]
+        assert reduce_type in valid_reduce_types, \
+            f"Please make sure to use reduce_type argument from {valid_reduce_types} for synchronisation."
+        tensor_score = torch.tensor(score, device=self.device)
+        # create a list that will hold synchronised score
+        score_list = [torch.zeros_like(tensor_score) for _ in range(self.world_size)]
+        # put all the tensors across the machines in the appropriate positions
+        dist.all_gather(score_list, tensor_score)
+        # stack all the machines
+        stacked_list = torch.stack(score_list)
+        # reduce to single score
+        if reduce_type == "mean":
+            reduced = torch.mean(stacked_list)
+        elif reduce_type == "sum":
+            reduced = torch.sum(stacked_list)
+        # for perplexity = e^{-logP/N} = \prod_i^W e^{-logP_i/N_i} = e^{\sum_i^W -logP_i/N_i}
+        elif reduce_type == "prod":
+            reduced = torch.prod(stacked_list)
+        return float(reduced)
+
     def _validate(self, valid_data, epoch_no, track_mbr=False):
         valid_start_time = time.time()
         logger.info(f"Validation by {'mbr' if track_mbr else 'greedy'} decoding")
         valid_score, valid_loss, valid_ppl, valid_sources, \
         valid_sources_raw, valid_references, valid_hypotheses, \
-        valid_hypotheses_raw, valid_attention_scores, utility = \
+        valid_hypotheses_raw, valid_attention_scores, valid_utility = \
             validate_on_data(
                 batch_size=self.eval_batch_size,
                 batch_class=self.batch_class,
@@ -706,13 +794,24 @@ class TrainManager:
                 rank=self.rank,
                 world_size=self.world_size
             )
+
+        # synchronise+reduce valid scores between the processess
+        if self.ddp:
+            for name, score in zip(["valid_loss", "valid_score", "valid_ppl", "valid_utility"],
+                                   [valid_loss, valid_score, valid_ppl, valid_utility]):
+                print(f"name {name}, score {score} ")
+            valid_loss = self._synch_reduce_ddp(valid_loss, reduce_type="sum")
+            valid_score = self._synch_reduce_ddp(valid_score, reduce_type="mean")
+            valid_ppl = self._synch_reduce_ddp(valid_ppl, reduce_type="prod")
+            valid_utility = self._synch_reduce_ddp(valid_utility,  reduce_type="sum")
+
         if not self.ddp or self.rank == 0:
-            self.tb_writer.add_scalar("valid/valid_loss", valid_loss,
-                                      self.stats.steps)
-            self.tb_writer.add_scalar("valid/valid_score", valid_score,
-                                      self.stats.steps)
-            self.tb_writer.add_scalar("valid/valid_ppl", valid_ppl,
-                                      self.stats.steps)
+            for name, score in zip(["valid_loss", "valid_score", "valid_ppl", "valid_utility"],
+                                   [valid_loss, valid_score, valid_ppl, valid_utility]):
+                self.tb_writer.add_scalar(f"valid/{name}", score,
+                                          self.stats.steps)
+                if self.use_wandb:
+                    wandb.log({f"valid/{name}": score})
 
         if self.early_stopping_metric == "loss":
             ckpt_score = valid_loss
@@ -721,8 +820,7 @@ class TrainManager:
         else:
             ckpt_score = valid_score
 
-        if self.scheduler is not None \
-                and self.scheduler_step_at == "validation":
+        if self.scheduler is not None and self.scheduler_step_at == "validation":
             self.scheduler.step(ckpt_score)
 
         new_best = False
@@ -746,7 +844,7 @@ class TrainManager:
                          valid_ppl=valid_ppl,
                          eval_metric=self.eval_metric,
                          new_best=new_best,
-                         utility=utility,
+                         utility=valid_utility,
                          mbr=track_mbr)
         if not self.small_test_run:
             self._log_examples(sources_raw=[v for v in valid_sources_raw],
@@ -759,9 +857,9 @@ class TrainManager:
         valid_type = "mbr" if track_mbr else "greedy"
         logger.info(
             f'Validation result (%s) at epoch %3d, '
-            'step %8d: %s: %6.2f, loss: %8.4f, ppl: %8.4f, '
+            'step %8d: %s: %6.2f, loss: %8.4f, ppl: %8.4f,  utility:%8.2f '
             'duration: %.4fs', valid_type, epoch_no + 1, self.stats.steps, self.eval_metric,
-            valid_score, valid_loss, valid_ppl, valid_duration)
+            valid_score, valid_loss, valid_ppl, valid_utility, valid_duration)
 
         # store validation set outputs
         self._store_outputs(valid_hypotheses)
@@ -971,8 +1069,11 @@ def train(cfg_file: str) -> None:
         parent_conn, child_conn = mp.Pipe()
         logger.info("Training using multiple GPUs")
         spawn_multiprocess(trainer.train_and_validate, (train_data, dev_data, child_conn))
-        last_checkpoint =  parent_conn.recv()
-        print("Parent connection got",last_checkpoint)
+        last_checkpoint = parent_conn.recv()
+        i = 0
+        while parent_conn.poll():
+            logger.info(f"Parent connection {i} got {parent_conn.recv()}")
+            i += 1
         trainer.stats.best_ckpt_iter = last_checkpoint
     else:
         trainer.train_and_validate(train_data=train_data, valid_data=dev_data)
@@ -988,14 +1089,14 @@ def train(cfg_file: str) -> None:
         "src_vocab": src_vocab,
         "trg_vocab": trg_vocab
     }
-    print("checkpoint name", ckpt)
+    logger.info(f"checkpoint name {ckpt}")
     test(cfg_file,
          ckpt=ckpt,
          output_path=output_path,
          datasets=datasets_to_test)
 
 
-def spawn_multiprocess(train_fn, args, child_conn):
+def spawn_multiprocess(train_fn, args):
     num_gpus = torch.cuda.device_count()
     # world_size = num_gpus * num_nodes
     os.environ['MASTER_ADDR'] = '127.0.0.1'  # lisa IP
