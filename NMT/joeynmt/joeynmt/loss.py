@@ -53,44 +53,40 @@ class XentLoss(nn.Module):
                                              need_grad=True, compute_log_probs=True,
                                              encoded_batch=None)
 
-        log_uh = torch.log(u_h).detach()
+        # log_uh = torch.log(u_h).detach()
 
-        # if we use mean control variate, substract the current mean and then update the mean
-        if self.mean_baseline:
-            # new log utility is  log utility
-            mean_baseline = self._utility_running_average
-            # update running mean += (utility_sample_mean - running mean)/N
-            self._utility_step += 1
-            self._utility_running_average += (torch.mean(log_uh).item() - self._utility_running_average) \
-                                             / self._utility_step
-        else:
-            mean_baseline = 0
         # VIMCO control variate from arxiv.org/pdf/1602.06725.pdf
         # vimco_baseline_j = log (\sum_i^{-j} u_i + mean^{-j}) -logS
         # todo maybe log sum exp + log sub exp ?
         # todo look into beer range
         if self.vimco_baseline:
             # get all the utilities in the sample[B]
-            total_utility = torch.sum(log_uh, dim=1)
+            total_utility = torch.sum(u_h, dim=1)
             # substract the jth element at the jth index [B,S]
-            sum_min_j = total_utility.unsqueeze(-1) - log_uh
+            sum_min_j = total_utility.unsqueeze(-1) - u_h
             # get the mean without the jth
             mean_min_j = sum_min_j - log(self.num_samples - 1)
             # baseline is the sum without the jth + mean without the jth
             vimco_baseline = sum_min_j + mean_min_j - log(self.num_samples)
         else:
             vimco_baseline = 0
-        # substract the baseline
-        log_uh = log_uh - mean_baseline - vimco_baseline
+        # substract the vimco baseline
+        u_h = u_h - vimco_baseline
+        # if we use mean control variate, substract the current mean and then update the mean
+        if self.mean_baseline:
+            # new log utility is  log utility
+            mean_baseline = self._utility_running_average
+            # update running mean += (utility_sample_mean - running mean)/N
+            self._utility_step += 1
+            self._utility_running_average += (torch.mean(u_h).item() - self._utility_running_average) \
+                                             / self._utility_step
+        else:
+            mean_baseline = 0
+        # substract the mean baseline
+        u_h = u_h - mean_baseline
         # compute mean of U(y,h) * \grad p(y)
-        utility_term = torch.mean(log_uh.to(sample_log_probs.device) * sample_log_probs)
-        # if torch.isinf(utility_term).any():
-        #     logger.info("INF UTILITY" * 100)
-        #     logger.info(f"log_uh is inf? {torch.isinf(log_uh).any()}")
-        #     logger.info(f"sample_log_probs is inf? {torch.isinf(sample_log_probs).any()}")
-        #
-        # if torch.isinf(batch_loss).any():
-        #     logger.info("INF batch loss")
+        utility_term = torch.mean(u_h.to(sample_log_probs.device) * sample_log_probs)
+
         # add to the batch loss
         batch_loss += utility_term * self.utility_alpha
         utility_term = utility_term.item()
