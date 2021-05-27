@@ -5,8 +5,12 @@ NMT/tutorials/transformer_nmt/.data
 NMT/tutorials/translation_tutorial/.data
 NMT/nmt_venv
 
+# wandb
+NMT/joeynmt/wandb
+NMT/joeynmt/wandb_api_key.txt
 LCDA/bayesian regression/wandb
-
+# beer
+NMT/joeynmt/beer_2.0
 LCDA/.idea
 NMT/.idea
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --partition=gpu
+#SBATCH --partition=gpu_short
 #_shared
 #SBATCH --gres=gpu:2
 #SBATCH --job-name=DDP
@@ -26,6 +26,8 @@ cd ..
 cd $HOME/joeynmt
 pip install --user -r requirements.txt
 pip install --user --editable .
+pip install --user wandb
+wandb login
 
 
 # Activate your environment
