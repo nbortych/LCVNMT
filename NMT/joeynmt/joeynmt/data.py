@@ -201,8 +201,9 @@ class BatchSamplerSimilarLength(Sampler):
         self.shuffle = shuffle
         # get the indicies and length
         self.indices = [(i, src_len) for i, (src, src_len, trg, trg_len) in enumerate(dataset)]
+        # if indices are passed, then use only the ones passed (for ddp)
         if indices is not None:
-            self.indices = self.indices[indices]
+            self.indices = torch.tensor(self.indices)[indices].tolist()
 
     def __iter__(self):
         if self.shuffle:
@@ -236,7 +237,7 @@ class DistributedBatchSamplerSimilarLength(DistributedSampler):
         self.batch_size = batch_size
 
     def __iter__(self):
-        indices = list(super.__iter__())
+        indices = list(super().__iter__())
         batch_sampler = BatchSamplerSimilarLength(self.dataset, batch_size=self.batch_size, indices=indices)
         return iter(batch_sampler)
 
