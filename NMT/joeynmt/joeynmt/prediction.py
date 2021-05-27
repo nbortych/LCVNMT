@@ -119,6 +119,7 @@ def validate_on_data(model: Model, data: Dataset,
         data = val_subset_data
         logger.info(f"The lenght of validation data for small test run is {len(data)}")
         # batch_size = len(data)
+    model.ddp = getattr(model, "ddp", False)
     if  model.ddp:
         ddp_sampler = DistributedEvalSampler(data, num_replicas=world_size, rank=rank)
         ddp_indices = ddp_sampler.indices
@@ -387,6 +388,7 @@ def test(cfg_file,
     # build model and load parameters into it
     model = build_model(cfg["model"], src_vocab=src_vocab, trg_vocab=trg_vocab)
     model.load_state_dict(model_checkpoint["model_state"])
+    model.device = device
 
     if use_cuda:
         model.to(device)
@@ -543,7 +545,7 @@ def translate(cfg_file: str,
     # build model and load parameters into it
     model = build_model(cfg["model"], src_vocab=src_vocab, trg_vocab=trg_vocab)
     model.load_state_dict(model_checkpoint["model_state"])
-
+    model.device = device
     if use_cuda:
         model.to(device)
 
