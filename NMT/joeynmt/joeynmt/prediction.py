@@ -26,11 +26,10 @@ from joeynmt.data import load_data, make_dataloader, MonoDataset, DistributedEva
 from joeynmt.constants import UNK_TOKEN, PAD_TOKEN, EOS_TOKEN
 from joeynmt.vocabulary import Vocabulary
 
-# import os
-# ROOT_DIR = os.path.abspath(os.curdir)
-# print(ROOT_DIR)
-# import ..mbr_nmt.utility as utility
-
+try:
+    os.environ["BEER_HOME"]
+except:
+    os.environ["BEER_HOME"] = "./beer_2.0"
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +108,7 @@ def validate_on_data(model: Model, data: Dataset,
 
     # if small test run, use subset of the data that is one batch
     if small_test_run:
-        SMALL_DATA_SIZE = 5
+        SMALL_DATA_SIZE = 6
 
         val_subset_data, _ = torch.utils.data.random_split(data,
                                                            [SMALL_DATA_SIZE, len(data) - SMALL_DATA_SIZE],
@@ -119,16 +118,16 @@ def validate_on_data(model: Model, data: Dataset,
         data = val_subset_data
         logger.info(f"The lenght of validation data for small test run is {len(data)}")
         # batch_size = len(data)
+
     model.ddp = getattr(model, "ddp", False)
-    if  model.ddp:
+    if model.ddp:
         ddp_sampler = DistributedEvalSampler(data, num_replicas=world_size, rank=rank)
         ddp_indices = ddp_sampler.indices
     else:
         ddp_sampler = None
 
-    valid_dataloader = make_dataloader(
-        dataset=data, batch_size=batch_size,
-        shuffle=False, train=False, sampler=ddp_sampler)
+    valid_dataloader = make_dataloader(dataset=data, batch_size=batch_size,
+                                       shuffle=False, train=False, sampler=ddp_sampler)
     valid_sources_raw = [src for src, _, trg, _ in data]
     pad_index = model.src_vocab.stoi[PAD_TOKEN]
     # disable dropout
@@ -165,7 +164,7 @@ def validate_on_data(model: Model, data: Dataset,
             else:
                 output = mbr_decoding(model=model, batch=batch, max_output_length=max_output_length,
                                       compute_log_probs=False, need_grad=False, return_types=["h"],
-                                      num_samples=num_samples, mbr_type=mbr_type)[0]
+                                      num_samples=num_samples, mbr_type=mbr_type, utility_type=utility_type)[0]
                 attention_scores = None
 
             # sort outputs back to original order
@@ -233,20 +232,19 @@ def validate_on_data(model: Model, data: Dataset,
                     valid_hypotheses, valid_references)
             # compute utility
             if utility_type is not None:
-
-                if utility_type == "editdistance":
-                    utility = edit_distance_utility(valid_hypotheses, valid_references, reduce_type="sum")
+                logger.info(f"Utility type {utility_type}")
+                reduced_utility, utility_per_sentence = get_utility_of_samples(utility_type, valid_hypotheses,
+                                                                               valid_references, reduce_type="sum",
+                                                                               save_utility_per_sentence=save_utility_per_sentence)
+            # todo save utility per sentence
         else:
             current_valid_score = -1
-            utility = 0
-
-        # saves utility per sentence. Not implemented yet
-        # if save_utility_per_sentence:
-        #     get_utility_per_sentence(eval_metric.lower(), valid_hypotheses, valid_references)
+            reduced_utility = 0
+            utility_per_sentence = None
 
     return current_valid_score, valid_loss, valid_ppl, valid_sources, \
            valid_sources_raw, valid_references, valid_hypotheses, \
-           decoded_valid, valid_attention_scores, utility
+           decoded_valid, valid_attention_scores, reduced_utility
 
 
 def parse_test_args(cfg, mode="test"):
@@ -303,6 +301,7 @@ def parse_test_args(cfg, mode="test"):
         num_samples = cfg["testing"].get("num_samples", 10)
         mbr_type = cfg["testing"].get("mbr_type", 'editdistance')
         utility_type = cfg["testing"].get("utility", 'editdistance')
+        save_utility_per_sentence = cfg["testing"].get("save_utility_per_sentence", False)
 
     else:
         beam_size = 1
@@ -316,6 +315,7 @@ def parse_test_args(cfg, mode="test"):
         num_samples = 1
         mbr_type = 'editdistance'
         utility_type = None
+        save_utility_per_sentence = False
 
     mbr_text, empty = f"{mbr_type}_MBR_", ""
     decoding_description = f"{'Greedy decoding' if (not sample and not mbr) else f'{mbr_text if mbr else empty}Sample decoding'}" if beam_size < 2 else \
@@ -328,7 +328,8 @@ def parse_test_args(cfg, mode="test"):
     return batch_size, batch_type, use_cuda, device, n_gpu, level, \
            eval_metric, max_output_length, beam_size, beam_alpha, \
            postprocess, bpe_type, sacrebleu, decoding_description, \
-           tokenizer_info, sample, mbr, mbr_type, small_test_run, num_samples, utility_type
+           tokenizer_info, sample, mbr, mbr_type, small_test_run, \
+           num_samples, utility_type, save_utility_per_sentence
 
 
 # pylint: disable-msg=logging-too-many-args
@@ -379,9 +380,8 @@ def test(cfg_file,
     batch_size, batch_type, use_cuda, device, n_gpu, level, eval_metric, \
     max_output_length, beam_size, beam_alpha, postprocess, \
     bpe_type, sacrebleu, decoding_description, tokenizer_info, \
-    sample, mbr, mbr_type, small_test_run, num_samples, utility_type \
+    sample, mbr, mbr_type, small_test_run, num_samples, utility_type, save_utility_per_sentence \
         = parse_test_args(cfg, mode="test")
-
     # load model state from disk
     model_checkpoint = load_checkpoint(ckpt, use_cuda=use_cuda)
 
@@ -394,7 +394,9 @@ def test(cfg_file,
         model.to(device)
 
     # multi-gpu eval
-    if n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
+    # todo fix multigpu (DDP has problems with returning dict + if data is not devisable by n_gpu)
+    if n_gpu > 1 and not isinstance(model, torch.nn.DataParallel) and not model_checkpoint['ddp']:
+        logger.info("Got into multigpu during testing")
         model = _DataParallel(model)
 
     for data_set_name, data_set in data_to_predict.items():
@@ -537,7 +539,7 @@ def translate(cfg_file: str,
     batch_size, batch_type, use_cuda, device, n_gpu, level, _, \
     max_output_length, beam_size, beam_alpha, postprocess, \
     bpe_type, sacrebleu, _, _, sample, mbr, mbr_type, small_test_run, \
-    num_samples, utility_type = parse_test_args(cfg, mode="translate")
+    num_samples, utility_type, save_utility_per_sentence = parse_test_args(cfg, mode="translate")
 
     # load model state from disk
     model_checkpoint = load_checkpoint(ckpt, use_cuda=use_cuda)
@@ -594,20 +596,46 @@ def meteor_utility(candidate, sample):
     return utility_fn(hyp=candidate, ref=sample)
 
 
-def edit_distance_utility(sample_1, sample_2, reduce_type="mean"):
+def beer_utility(candidate, sample):
+    from mbr_nmt.utility import parse_utility
+    utility_fn = parse_utility('beer', lang='en')
+    return utility_fn(hyp=candidate, ref=sample)
+
+
+def get_utility_fn(utility_type):
+    if utility_type == "editdistance":
+        logger.info('Utility is actually editdistance')
+        utility_fn = editdistance.eval
+    elif utility_type == "beer":
+        from mbr_nmt.utility import parse_utility
+        logger.info('Utility is totally beer')
+        utility_fn = parse_utility('beer', lang='en')
+    elif utility_type == "meteor":
+        from mbr_nmt.utility import parse_utility
+        utility_fn = parse_utility('meteor', lang='en')
+    return utility_fn
+
+
+def get_utility_of_samples(utility_type, sample_1, sample_2, reduce_type="mean", save_utility_per_sentence=False):
     """
     Compute mean (by batch) or total edit distance utility between two samples shaped as BxL.
     """
+    utility_fn = get_utility_fn(utility_type)
     # iterate over batches in sample
-    total_utility = sum([editdistance.eval(batch_1, batch_2) for batch_1, batch_2 in zip(sample_1, sample_2)])
+    total_utility = [editdistance.eval(batch_1, batch_2) for batch_1, batch_2 in zip(sample_1, sample_2)]
     if reduce_type == "mean":
         # compute mean sample utility
-        return total_utility / len(sample_1)
+        reduced_utility = sum(total_utility) / len(sample_1)
     elif reduce_type == "sum":
-        return total_utility
+        reduced_utility = sum(total_utility)
+    # if we will not be saving utility, do not return it.
+    if save_utility_per_sentence == False:
+        total_utility = None
+    return reduced_utility, total_utility
 
 
-def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="editdistance", return_types=("h",),
+def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="editdistance",
+                 utility_type="editdistance", return_types=("h",),
                  need_grad=False, compute_log_probs=False, encoded_batch=None):
     set_of_possible_returns = {"h", "samples", "utilities", "log_probabilities"}
     assert len(set(return_types) - set_of_possible_returns) == 0, f"You have specified wrong return types. " \
@@ -633,8 +661,7 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
 
     if mbr_type == "editdistance":
         # define utility function
-        utility_fn = editdistance.eval
-
+        utility_fn = get_utility_fn(utility_type)
         # transform indices to str
         decoded_samples = [
             [' '.join(sample) for sample in model.trg_vocab.arrays_to_sentences(arrays=batch,
@@ -669,7 +696,8 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
             best_idx = best_idx.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, num_samples)
             # [BxS]
             u_h = U.gather(1, best_idx).squeeze(1)
-            u_h = u_h + 1e-10
+            print("u_h", u_h)
+            # u_h = u_h + 1e-10
             return_list.append(u_h)
         if "log_probabilities" in return_types:
             return_list.append(log_probs)
@@ -704,11 +732,6 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
         # string_samples = list(map(lambda sample: list(map(lambda batch: ''.join(list(map(str,batch))) , sample.tolist()) ),big_l))
         prediction_idx, prediction = mbr.mbr(string_samples, utility_fn)
         return prediction
-
-
-def get_utility_per_sentence(utility, hyp_samples, ref_samples):
-    # todo
-    raise NotImplementedError
 
 
 if __name__ == "__main__":

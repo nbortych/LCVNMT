@@ -41,23 +41,25 @@ class XentLoss(nn.Module):
         self._utility_running_average = 0
         self._utility_step = 0
 
-    def utility_loss(self, model, batch, batch_loss):
+    def utility_loss(self, model, batch, batch_loss, utility_type='editdistance'):
+        log_dict = {"nll": batch_loss.item()}
         # reinforce: \delta E = E_{p(y|\theta, x)} [log u(y,h) * \delta log p (y|\theta, x)]
         from joeynmt.prediction import mbr_decoding
         # compute mbr, get utility(samples, h)
         # todo pass encode batch to save computations
         u_h, sample_log_probs = mbr_decoding(model, batch, max_output_length=self.max_output_length,
                                              num_samples=self.num_samples,
-                                             mbr_type="editdistance",
+                                             mbr_type="editdistance", utility_type=utility_type,
                                              return_types=("utilities", "log_probabilities"),
                                              need_grad=True, compute_log_probs=True,
                                              encoded_batch=None)
 
         # log_uh = torch.log(u_h).detach()
-
+        log_dict['u_h'] = u_h.detach().clone().mean(dim=1).numpy()
+        log_dict['mean_utility'] = u_h.mean().item()
         # VIMCO control variate from arxiv.org/pdf/1602.06725.pdf
         # vimco_baseline_j = log (\sum_i^{-j} u_i + mean^{-j}) -logS
-        # todo maybe log sum exp + log sub exp ?
+        # todo maybe log sum exp + log sub exp !
         # todo look into beer range
         if self.vimco_baseline:
             # get all the utilities in the sample[B]
@@ -72,6 +74,9 @@ class XentLoss(nn.Module):
             vimco_baseline = 0
         # substract the vimco baseline
         u_h = u_h - vimco_baseline
+        log_dict['mean_vimco_utility'] = u_h.mean().item()
+        log_dict['mean_vimco'] = vimco_baseline.mean().item()
+
         # if we use mean control variate, substract the current mean and then update the mean
         if self.mean_baseline:
             # new log utility is  log utility
@@ -82,16 +87,18 @@ class XentLoss(nn.Module):
                                              / self._utility_step
         else:
             mean_baseline = 0
+        log_dict['mean_baseline'] = mean_baseline
         # substract the mean baseline
         u_h = u_h - mean_baseline
+        log_dict['mean_utility_after_baselines'] = u_h.mean().item()
         # compute mean of U(y,h) * \grad p(y)
         utility_term = torch.mean(u_h.to(sample_log_probs.device) * sample_log_probs)
-
+        log_dict['utility_term'] = utility_term.item()
         # add to the batch loss
         batch_loss += utility_term * self.utility_alpha
-        utility_term = utility_term.item()
+        # utility_term = utility_term.item()
 
-        return batch_loss, utility_term, u_h
+        return batch_loss, log_dict
 
     def _smooth_targets(self, targets: Tensor, vocab_size: int):
         """

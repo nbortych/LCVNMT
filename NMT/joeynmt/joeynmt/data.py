@@ -190,6 +190,8 @@ def make_dataloader(dataset: Dataset,
     if sampler is not None:
         assert batch_sampler is None, "You've passed both batch sampler and sampler to Dataloader"
 
+    # if sampler is None and batch_sampler is None:
+    #     kwargs['drop_last'] = True
     dataloader = DataLoader(dataset, **kwargs)
 
     return dataloader
@@ -323,7 +325,6 @@ class MonoDataset(Dataset):
                     # seperate into words
                     src_line = src_line.split()
                     # if vocab is provided, transform into indices
-                    # todo include lengths?
                     # src_len, trg_len = len(src_line), len(trg_line)
                     # if src_len<=max_sent_length and trg_len<=max_sent_length:
                     if vocab is None:

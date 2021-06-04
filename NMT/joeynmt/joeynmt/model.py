@@ -103,13 +103,15 @@ class Model(nn.Module):
             utility_reg = kwargs.get("utility_regularising", False)
             if utility_reg:
                 # todo pass encode batch to save computations
-                batch_loss, utility_term, u_h = self.loss_function.utility_loss(model=self, batch=kwargs['batch'],
-                                                                                batch_loss=batch_loss)
+                batch_loss, log_dict = self.loss_function.utility_loss(model=self,
+                                                                            batch=kwargs['batch'],
+                                                                            batch_loss=batch_loss,
+                                                                            utility_type = kwargs['utility_type'])
 
             else:
-                utility_term, u_h = None, None
+                log_dict = {"nll": batch_loss.item(), "utility_term": None, "u_h": None}
 
-            return_tuple = (batch_loss, utility_term, u_h, None)
+            return_tuple = (batch_loss, log_dict, None, None)
 
         elif return_type == "encode":
             encoder_output, encoder_hidden = self._encode(**kwargs)

@@ -14,7 +14,8 @@ import collections
 import pathlib
 import numpy as np
 import pickle
-import  copy
+import copy
+import operator
 
 import torch
 from torch import Tensor
@@ -97,8 +98,6 @@ class TrainManager:
         # using wandb to log hyperparams + log results
         self.use_wandb = train_config.get("wandb", False)
 
-
-
         # model
         self.model = model
         self._log_parameters_list()
@@ -171,6 +170,8 @@ class TrainManager:
             # eval metric that has to get minimized (not yet implemented)
             else:
                 self.minimize_metric = True
+        elif self.early_stopping_metric == "utility":
+            self.minimize_metric = False
         else:
             raise ConfigurationError(
                 "Invalid setting for 'early_stopping_metric', "
@@ -203,6 +204,8 @@ class TrainManager:
         self.epochs = train_config["epochs"]
         self.epoch_no = 0
         self.batch_size = train_config["batch_size"]
+        self.early_stopping = train_config.get("early_stopping", True)
+        self.early_stopping_patience = train_config.get("early_stopping_patience", 10)
         # Placeholder so that we can use the train_iter in other functions.
         self.dataloader = None
         self.train_iter_state = None
@@ -262,10 +265,11 @@ class TrainManager:
             total_tokens=0,
             best_ckpt_iter=0,
             best_ckpt_score=np.inf if self.minimize_metric else -np.inf,
-            minimize_metric=self.minimize_metric)
+            minimize_metric=self.minimize_metric,
+            early_stopping_patience=self.early_stopping_patience)
 
         # model parameters
-        if "load_model" in train_config.keys():
+        if "load_model" in train_config.keys() and not self.ddp:
             self.init_from_checkpoint(
                 train_config["load_model"],
                 reset_best_ckpt=train_config.get("reset_best_ckpt", False),
@@ -387,11 +391,10 @@ class TrainManager:
                                 use the one stored in the checkpoint.
         """
         logger.info("Loading model from %s", path)
-        model_checkpoint = load_checkpoint(path=path, use_cuda=self.use_cuda)
+        model_checkpoint = load_checkpoint(path=path, use_cuda=self.use_cuda, ddp=self.ddp, rank=self.rank)
 
         # restore model and optimizer parameters
         self.model.load_state_dict(model_checkpoint["model_state"])
-        self.model.ddp = model_checkpoint["ddp"]
 
         if not reset_optimizer:
             self.optimizer.load_state_dict(model_checkpoint["optimizer_state"])
@@ -422,8 +425,7 @@ class TrainManager:
         # reset the epoch
         self.epoch_no = model_checkpoint['epoch_no']
         # move parameters to cuda
-        # todo if ddp do something
-        if self.use_cuda:
+        if self.use_cuda and not self.ddp:
             self.model.to(self.device)
 
         # fp16
@@ -457,8 +459,16 @@ class TrainManager:
         )
         self.device = torch.device(gpu)
         self.model.to(self.device)
-        self.model = _DistributedDataParallel(self.model, device_ids=[gpu])
         logger.info(f"Model wrapped")
+
+        if "load_model" in self.train_config.keys():
+            self.init_from_checkpoint(
+                self.train_config["load_model"],
+                reset_best_ckpt=self.train_config.get("reset_best_ckpt", False),
+                reset_scheduler=self.train_config.get("reset_scheduler", False),
+                reset_optimizer=self.train_config.get("reset_optimizer", False),
+                reset_iter_state=self.train_config.get("reset_iter_state", False))
+        self.model = _DistributedDataParallel(self.model, device_ids=[gpu])
 
         if self.distributed_batch_sampler:
             self.batch_sampler = DistributedBatchSamplerSimilarLength(train_data, self.batch_size)
@@ -472,23 +482,33 @@ class TrainManager:
                 self.init_wandb(self.config)
         self.child_conn = child_conn
 
-    def _log_training(self,batch_loss):
+    def _log_training(self, batch_loss, log_dict):
         # tensorflow
         self.tb_writer.add_scalar("train/train_batch_loss",
                                   batch_loss, self.stats.steps)
         # wandb
         if self.use_wandb:
-            wandb.log({"train/train_batch_loss": batch_loss})
+            wandb.log({"train/train_batch_loss_normalised": batch_loss})
+            wandb.log({"train/nll": log_dict['nll']})
 
-        if self.stats.utility_term is not None:
-            self.tb_writer.add_scalar("train/train_utility_term_loss",
-                                      self.stats.utility_term, self.stats.steps)
-            self.tb_writer.add_histogram("train/utilities_histogram", self.stats.u_h,
+        if log_dict["utility_term"] is not None:
+            # special, since it's a histogram
+            u_h = log_dict['u_h']
+            del log_dict["u_h"]
+            log_dict = {f"train/{key}": value for key, value in log_dict.items()}
+
+            for stat_name, stat_value in log_dict.items():
+                self.tb_writer.add_scalar(stat_name, stat_value, self.stats.steps)
+            self.tb_writer.add_histogram("train/utilities_histogram", u_h,
                                          self.stats.steps)
             if self.use_wandb:
-                wandb.log({"train/train_utility_term_loss":self.stats.utility_term, "train/utilities_histogram": wandb.Histogram(self.stats.u_h)})
+                print(f'u_h is {u_h.shape}')
+                log_dict["train/utilities_histogram"] = wandb.Histogram(u_h)
+                log_dict["train/utilities_histogram"] = wandb.Histogram([1, 2, 3])
+                # print(f"is u_h in log_dict? {log_dict['train/utilities_histogram']}")
+                wandb.log(log_dict)
 
-                # pylint: disable=unnecessary-comprehension
+    # pylint: disable=unnecessary-comprehension
     # pylint: disable=too-many-branches
     # pylint: disable=too-many-statements
     def train_and_validate(self, gpu: int = 0, train_data: Dataset = None, valid_data: Dataset = None, child_conn=None) \
@@ -500,7 +520,7 @@ class TrainManager:
         :param valid_data: validation data
         """
         logger.info(f'gpu {gpu}')
-        print(f'gpu {gpu}')
+        # print(f'gpu {gpu}')
         logger.info("Initialised")
         # if small test run, use subset of the data that is one batch
         if self.small_test_run:
@@ -555,7 +575,7 @@ class TrainManager:
             "\tbatch size per device: %d\n"
             "\ttotal batch size (w. parallel & accumulation): %d", self.device,
             self.n_gpu, self.fp16, self.batch_multiplier, self.batch_size //
-                                                          self.n_gpu if self.n_gpu > 1 else self.batch_size,
+                                                          self.n_gpu if self.n_gpu > 1 and not self.ddp else self.batch_size,
             self.batch_size * self.batch_multiplier)
 
         # if we don't train, for debug purposes
@@ -588,15 +608,15 @@ class TrainManager:
                     self.train_sampler.set_epoch(self.epoch_no)
 
             for i, batch in enumerate(self.dataloader):
-                print(batch[1], batch[-1])
+                # print(batch[1], batch[-1])
                 # create a Batch object from torch batch
                 batch = self.batch_class(batch, self.model.pad_index,
                                          use_cuda=self.use_cuda, device=self.device)
                 # print(batch.src.shape, batch.src_length)
 
                 # get batch loss
-                batch_loss += self._train_step(batch)
-
+                batch_loss_iter, log_dict = self._train_step(batch)
+                batch_loss += batch_loss_iter
                 # update!
                 if (i + 1) % self.batch_multiplier == 0:
                     # clip gradients (in-place)
@@ -623,9 +643,9 @@ class TrainManager:
 
                     # log learning progress
                     # todo log more things here
-                    if self.stats.steps % self.logging_freq == 0:
+                    if self.stats.steps % self.logging_freq == 0 or self.small_test_run:
                         if not self.ddp or self.rank == 0:
-                           self._log_training(batch_loss)
+                            self._log_training(batch_loss, log_dict)
 
                         elapsed = time.time() - start - total_valid_duration
                         elapsed_tokens = self.stats.total_tokens - start_tokens
@@ -661,7 +681,7 @@ class TrainManager:
                 logger.info(
                     f"End of epoch {epoch_no + 1}, it took {epoch_duration:.3f}. Epoch loss is {epoch_loss:.4f}")
             # validate at the end of epoch if small
-            if self.small_test_run or True:
+            if self.small_test_run:
                 valid_duration = self._validate(valid_data, epoch_no)
                 if self.track_mbr:
                     mbr_valid_duration = self._validate(valid_data, epoch_no, True)
@@ -669,34 +689,41 @@ class TrainManager:
                     total_valid_duration += valid_duration
 
             if self.stats.stop:
-                logger.info('Training ended since minimum lr %f was reached.',
-                            self.learning_rate_min)
+                if self.stats.early_stopping:
+                    logger.info(f'Training ended due to early stopping.'
+                                f' {self.early_stopping_metric} did not improve on the validation set'
+                                f'for the last {self.early_stopping_patience} evaluations.')
+                else:
+                    logger.info('Training ended since minimum lr %f was reached.',
+                                self.learning_rate_min)
                 break
 
-            # logger.info('Epoch %3d: total training loss %.2f', epoch_no + 1,
-            #             epoch_loss)
         else:
             logger.info('Training ended after %3d epochs.', epoch_no + 1)
         logger.info('Best validation result (greedy) at step %8d: %6.2f %s.',
                     self.stats.best_ckpt_iter, self.stats.best_ckpt_score,
                     self.early_stopping_metric)
+
         if not self.ddp or self.rank == 0:
             self.tb_writer.close()  # close Tensorboard writer
+            if self.use_wandb:
+                wandb.finish()
 
-    def _train_step(self, batch: Batch) -> Tensor:
+    def _train_step(self, batch: Batch) -> (Tensor, dict):
         """
         Train the model on one batch: Compute the loss.
 
         :param batch: training batch
-        :return: loss for batch (sum)
+        :return: loss for batch (sum), log dictionary
         """
         # reactivate training
         self.model.train()
         # get loss
-        batch_loss, utility_term, u_h, _ = self.model(return_type="loss",
-                                                      **{"batch": batch,
-                                                         "utility_regularising": self.utility_regularising,
-                                                         **vars(batch)})
+        batch_loss, log_dict, _, _ = self.model(return_type="loss",
+                                                **{"batch": batch,
+                                                   "utility_regularising": self.utility_regularising,
+                                                   'utility_type': self.utility_type,
+                                                   **vars(batch)})
 
         # sum multi-gpu losses
         if self.n_gpu > 1 and not self.ddp:
@@ -715,7 +742,7 @@ class TrainManager:
 
         norm_batch_loss = batch_loss / normalizer
 
-        if self.n_gpu > 1:
+        if self.n_gpu > 1 and not self.ddp:
             norm_batch_loss = norm_batch_loss / self.n_gpu
 
         if self.batch_multiplier > 1:
@@ -731,9 +758,7 @@ class TrainManager:
         # increment token counter
         self.stats.total_tokens += batch.ntokens
 
-        self.stats.utility_term = utility_term
-        self.stats.u_h = u_h
-        return norm_batch_loss.item()
+        return norm_batch_loss.item(), log_dict
 
     def _synch_reduce_ddp(self, score, reduce_type="mean"):
         """
@@ -750,13 +775,19 @@ class TrainManager:
         valid_reduce_types = ["mean", "sum", "prod"]
         assert reduce_type in valid_reduce_types, \
             f"Please make sure to use reduce_type argument from {valid_reduce_types} for synchronisation."
-        tensor_score = torch.tensor(score, device=self.device)
+        # if the score is tensor, clone it, otherwise create a tensor of it
+        if type(score) == torch.Tensor:
+            tensor_score = score.detach().clone().to(self.device)
+        else:
+            tensor_score = torch.tensor(score, device=self.device)
         # create a list that will hold synchronised score
         score_list = [torch.zeros_like(tensor_score) for _ in range(self.world_size)]
         # put all the tensors across the machines in the appropriate positions
         dist.all_gather(score_list, tensor_score)
+
         # stack all the machines
         stacked_list = torch.stack(score_list)
+
         # reduce to single score
         if reduce_type == "mean":
             reduced = torch.mean(stacked_list)
@@ -769,7 +800,7 @@ class TrainManager:
 
     def _validate(self, valid_data, epoch_no, track_mbr=False):
         valid_start_time = time.time()
-        logger.info(f"Validation by {'mbr' if track_mbr else 'greedy'} decoding")
+        logger.info(f"Validation by {'mbr' if track_mbr else 'greedy'} decoding.")
         valid_score, valid_loss, valid_ppl, valid_sources, \
         valid_sources_raw, valid_references, valid_hypotheses, \
         valid_hypotheses_raw, valid_attention_scores, valid_utility = \
@@ -797,15 +828,21 @@ class TrainManager:
 
         # synchronise+reduce valid scores between the processess
         if self.ddp:
-            for name, score in zip(["valid_loss", "valid_score", "valid_ppl", "valid_utility"],
-                                   [valid_loss, valid_score, valid_ppl, valid_utility]):
-                print(f"name {name}, score {score} ")
+            # for name, score in zip(["valid_loss", "valid_score", "valid_ppl", "valid_utility"],
+            #                        [valid_loss, valid_score, valid_ppl, valid_utility]):
+            #     print(f"name {name}, score {score} ")
+            # todo normalise loss
+            # todo compute bleu + sentence level utility histogram validation
+            # utility average
             valid_loss = self._synch_reduce_ddp(valid_loss, reduce_type="sum")
             valid_score = self._synch_reduce_ddp(valid_score, reduce_type="mean")
             valid_ppl = self._synch_reduce_ddp(valid_ppl, reduce_type="prod")
-            valid_utility = self._synch_reduce_ddp(valid_utility,  reduce_type="sum")
+            valid_utility = self._synch_reduce_ddp(valid_utility, reduce_type="sum")
+
 
         if not self.ddp or self.rank == 0:
+            logger.info("Got to logging validation")
+
             for name, score in zip(["valid_loss", "valid_score", "valid_ppl", "valid_utility"],
                                    [valid_loss, valid_score, valid_ppl, valid_utility]):
                 self.tb_writer.add_scalar(f"valid/{name}", score,
@@ -817,11 +854,17 @@ class TrainManager:
             ckpt_score = valid_loss
         elif self.early_stopping_metric in ["ppl", "perplexity"]:
             ckpt_score = valid_ppl
+        elif self.early_stopping_metric == "utility":
+            ckpt_score = valid_utility
         else:
             ckpt_score = valid_score
 
         if self.scheduler is not None and self.scheduler_step_at == "validation":
             self.scheduler.step(ckpt_score)
+
+        # early stopping of the training
+        if self.early_stopping and not track_mbr:
+            self.stats.early_stopping_step(ckpt_score)
 
         new_best = False
         if self.stats.is_best(ckpt_score) and (not self.ddp or self.rank == 0):
@@ -857,9 +900,9 @@ class TrainManager:
         valid_type = "mbr" if track_mbr else "greedy"
         logger.info(
             f'Validation result (%s) at epoch %3d, '
-            'step %8d: %s: %6.2f, loss: %8.4f, ppl: %8.4f,  utility:%8.2f '
+            'step %8d: %s: %6.2f, loss: %8.4f, ppl: %8.4f,  utility %s:%8.2f '
             'duration: %.4fs', valid_type, epoch_no + 1, self.stats.steps, self.eval_metric,
-            valid_score, valid_loss, valid_ppl, valid_utility, valid_duration)
+            valid_score, valid_loss, valid_ppl,self.utility_type, valid_utility, valid_duration)
 
         # store validation set outputs
         self._store_outputs(valid_hypotheses)
@@ -926,8 +969,6 @@ class TrainManager:
             n for (n, p) in self.model.named_parameters() if p.requires_grad
         ]
         logger.debug("Trainable parameters: %s", sorted(trainable_params))
-        # todo remove
-        # assert trainable_params
 
     def _log_examples(self,
                       sources: List[str],
@@ -983,11 +1024,12 @@ class TrainManager:
                      total_tokens: int = 0,
                      best_ckpt_iter: int = 0,
                      best_ckpt_score: float = np.inf,
-                     minimize_metric: bool = True) -> None:
+                     minimize_metric: bool = True,
+                     early_stopping_patience=False) -> None:
             # global update step counter
             self.steps = steps
             # stop training if this flag is True
-            # by reaching learning rate minimum
+            # by reaching learning rate minimum or due to early stopping
             self.stop = stop
             # number of total tokens seen so far
             self.total_tokens = total_tokens
@@ -997,17 +1039,40 @@ class TrainManager:
             self.best_ckpt_score = best_ckpt_score
             # minimize or maximize score
             self.minimize_metric = minimize_metric
+            if self.minimize_metric:
+                self.comparison = operator.lt
+            else:
+                self.comparison = operator.gt
 
-            # temporary holders for stats
-            self.utility_term = None
-            self.u_h = None
+            # early stopping stats
+            self.early_stopping_patience = early_stopping_patience
+            if self.minimize_metric:
+                self.previous_scores_queue = [10e+10] * self.early_stopping_patience
+            else:
+                self.previous_scores_queue = [10e-10] * self.early_stopping_patience
+            # reason for stopping
+            self.early_stopping = False
 
         def is_best(self, score):
-            if self.minimize_metric:
-                is_best = score < self.best_ckpt_score
-            else:
-                is_best = score > self.best_ckpt_score
+            is_best = self.comparison(score, self.best_ckpt_score)
             return is_best
+
+        def early_stopping_step(self, score):
+            # remove the oldest element in the queue
+            self.previous_scores_queue.pop(0)
+            # append the score
+            self.previous_scores_queue.append(score)
+            # shall we stop?
+            self.early_stopping = True
+            # compare each element sequentially. if it does not improve, early stop
+            for i, previous_score in enumerate(self.previous_scores_queue[:-1]):
+                next_score = self.previous_scores_queue[i + 1]
+                is_improving = self.comparison(next_score, previous_score)
+                if is_improving:
+                    self.early_stopping = False
+            # stop
+            if self.early_stopping:
+                self.stop = True
 
 
 def train(cfg_file: str) -> None:
@@ -1016,6 +1081,7 @@ def train(cfg_file: str) -> None:
 
     :param cfg_file: path to configuration yaml file
     """
+
     cfg = load_config(cfg_file)
 
     # make logger
@@ -1029,17 +1095,10 @@ def train(cfg_file: str) -> None:
     set_seed(seed=cfg["training"].get("random_seed", 42))
 
     # load the data
-    if not cfg["training"].get("skip_vocab", True):
-        train_data, dev_data, test_data, src_vocab, trg_vocab = load_data(
-            data_cfg=cfg["data"])
-    else:
-        train_data, dev_data, test_data = (['1', '2', '1', '2'], ['1', '2', '1', '2']), \
-                                          (['1', '2', '1', '2'], ['1', '2', '1', '2']), \
-                                          (['1', '2', '1', '2'], ['1', '2', '1', '2'])
-        src_vocab = build_vocab(language="src", min_freq=0, max_size=2,
-                                dataset=train_data)
-        trg_vocab = build_vocab(language="trg", min_freq=0, max_size=2,
-                                dataset=train_data)
+
+    train_data, dev_data, test_data, src_vocab, trg_vocab = load_data(
+        data_cfg=cfg["data"])
+
     # build an encoder-decoder model
     model = build_model(cfg["model"], src_vocab=src_vocab, trg_vocab=trg_vocab)
 
