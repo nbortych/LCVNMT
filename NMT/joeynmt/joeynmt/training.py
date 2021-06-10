@@ -331,8 +331,11 @@ class TrainManager:
             "epoch_no":
                 self.epoch_no,
             'ddp':
-                self.ddp
+                self.ddp,
+            "scores_queue":
+                self.stats.previous_scores_queue
         }
+
         torch.save(state, model_path)
         symlink_target = "{}.ckpt".format(self.stats.steps)
         if new_best:
@@ -412,6 +415,7 @@ class TrainManager:
         # restore counts
         self.stats.steps = model_checkpoint["steps"]
         self.stats.total_tokens = model_checkpoint["total_tokens"]
+        self.stats.previous_scores_queue = model_checkpoint["scores_queue"]
 
         if not reset_best_ckpt:
             self.stats.best_ckpt_score = model_checkpoint["best_ckpt_score"]
@@ -1047,9 +1051,9 @@ class TrainManager:
             # early stopping stats
             self.early_stopping_patience = early_stopping_patience
             if self.minimize_metric:
-                self.previous_scores_queue = [10e+10] * self.early_stopping_patience
+                self.previous_scores_queue = [np.inf] * self.early_stopping_patience
             else:
-                self.previous_scores_queue = [10e-10] * self.early_stopping_patience
+                self.previous_scores_queue = [-np.inf] * self.early_stopping_patience
             # reason for stopping
             self.early_stopping = False
 
