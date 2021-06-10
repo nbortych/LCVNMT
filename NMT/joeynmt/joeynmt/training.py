@@ -1064,8 +1064,11 @@ class TrainManager:
 
         :param hypotheses: list of strings
         """
+
         current_valid_output_file = "{}/{}.hyps".format(self.model_dir,
-                                                        self.stats.steps)
+                                                    self.stats.steps if not self.ddp else
+                                                        f'{self.stats.steps}_{self.rank}')
+        
         with open(current_valid_output_file, 'w') as opened_file:
             for hyp in hypotheses:
                 opened_file.write("{}\n".format(hyp))
