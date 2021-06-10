@@ -441,7 +441,7 @@ class TrainManager:
                         small_data_size=30, small_epochs=2, batch_size_dividor=5):
         logger.info(f"The lenght of small data is {small_data_size}")
         self.batch_size = small_data_size // batch_size_dividor
-        self.epochs = small_epochs
+        # self.epochs = small_epochs
         self.validation_freq = 10000
 
         subset_data, _ = torch.utils.data.random_split(data,
