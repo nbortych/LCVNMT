@@ -853,21 +853,17 @@ class TrainManager:
             # todo normalise loss
             # todo compute bleu + sentence level utility histogram validation
             # utility average
-            valid_loss = self._synch_reduce_ddp(valid_loss, reduce_type="sum")
-            valid_score = self._synch_reduce_ddp(valid_score, reduce_type="mean")
-            valid_ppl = self._synch_reduce_ddp(valid_ppl, reduce_type="prod")
-            valid_utility = self._synch_reduce_ddp(valid_utility, reduce_type="sum")
+            logger.info(f"Synchronising {self.rank} {valid_type_str} valid loss {valid_loss}" )
+            valid_loss = self._synch_reduce_ddp(valid_loss, reduce_type="mean")
+            if self.eval_metric!='':
+                valid_score = self._synch_reduce_ddp(valid_score, reduce_type="mean")
 
+            valid_ppl = self._synch_reduce_ddp(valid_ppl, reduce_type="mean")
+            logger.info(f"Synchronising {self.rank} {valid_type_str}, valid_ppl {valid_ppl}, valid_utility {valid_utility}" )
+            valid_utility = self._synch_reduce_ddp(valid_utility, reduce_type="mean")
 
-        if not self.ddp or self.rank == 0:
-            logger.info("Got to logging validation")
-
-            for name, score in zip(["valid_loss", "valid_score", "valid_ppl", "valid_utility"],
-                                   [valid_loss, valid_score, valid_ppl, valid_utility]):
-                self.tb_writer.add_scalar(f"valid/{name}", score,
-                                          self.stats.steps)
-                if self.use_wandb:
-                    wandb.log({f"valid/{name}": score})
+        logger.info(f"Valid utility is {valid_utility}, rank {self.rank} {valid_type_str}")
+        logger.info(f"Synchronized {self.rank} {valid_type_str}")
 
         if self.early_stopping_metric == "loss":
             ckpt_score = valid_loss
@@ -878,13 +874,20 @@ class TrainManager:
         else:
             ckpt_score = valid_score
 
-        if self.scheduler is not None and self.scheduler_step_at == "validation":
+        if self.scheduler is not None and self.scheduler_step_at == "validation" and not track_mbr:
             self.scheduler.step(ckpt_score)
 
         # early stopping of the training
         if self.early_stopping and not track_mbr:
             self.stats.early_stopping_step(ckpt_score)
+        if not self.ddp or self.rank == 0:
 
+            for name, score in zip(["valid_loss", "valid_score", "valid_ppl", "valid_utility"],
+                                   [valid_loss, valid_score, valid_ppl, valid_utility]):
+                self.tb_writer.add_scalar(f"valid/{name}", score,
+                                          self.stats.steps)
+                if self.use_wandb:
+                    wandb.log({f"valid/{name}": score})
         new_best = False
         if self.stats.is_best(ckpt_score) and (not self.ddp or self.rank == 0):
             self.stats.best_ckpt_score = ckpt_score
@@ -900,14 +903,15 @@ class TrainManager:
         elif self.save_latest_checkpoint and (not self.ddp or self.rank == 0):
             self._save_checkpoint(new_best)
 
+        if not self.ddp or self.rank == 0:
         # append to validation report
-        self._add_report(valid_score=valid_score,
-                         valid_loss=valid_loss,
-                         valid_ppl=valid_ppl,
-                         eval_metric=self.eval_metric,
-                         new_best=new_best,
-                         utility=valid_utility,
-                         mbr=track_mbr)
+            self._add_report(valid_score=valid_score,
+                             valid_loss=valid_loss,
+                             valid_ppl=valid_ppl,
+                             eval_metric=self.eval_metric,
+                             new_best=new_best,
+                             utility=valid_utility,
+                             mbr=track_mbr)
         if not self.small_test_run:
             self._log_examples(sources_raw=[v for v in valid_sources_raw],
                                sources=valid_sources,
