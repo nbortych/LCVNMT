@@ -147,6 +147,7 @@ class TrainManager:
         self.ckpt_queue = collections.deque(
             maxlen=train_config.get("keep_last_ckpts", 5))
         self.eval_metric = train_config.get("eval_metric", "bleu")
+        logger.info(f"Eval metric is {self.eval_metric} , {'!'*100}")
         if self.eval_metric not in [
             'bleu', 'chrf', 'token_accuracy', 'sequence_accuracy', ''
         ]:
@@ -175,7 +176,7 @@ class TrainManager:
         else:
             raise ConfigurationError(
                 "Invalid setting for 'early_stopping_metric', "
-                "valid options: 'loss', 'ppl', 'eval_metric'.")
+                "valid options: 'loss', 'ppl', 'eval_metric', 'utility'.")
 
         # eval options
         test_config = config["testing"]
