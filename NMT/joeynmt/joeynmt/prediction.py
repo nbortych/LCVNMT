@@ -623,7 +623,7 @@ def get_utility_of_samples(utility_type, sample_1, sample_2, reduce_type="mean",
     """
     utility_fn = get_utility_fn(utility_type)
     # iterate over batches in sample
-    total_utility = [editdistance.eval(batch_1, batch_2) for batch_1, batch_2 in zip(sample_1, sample_2)]
+    total_utility = [utility_fn(batch_1, batch_2) for batch_1, batch_2 in zip(sample_1, sample_2)]
     if reduce_type == "mean":
         # compute mean sample utility
         reduced_utility = sum(total_utility) / len(sample_1)
