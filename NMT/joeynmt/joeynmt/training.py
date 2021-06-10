@@ -259,14 +259,15 @@ class TrainManager:
             # see https://nvidia.github.io/apex/amp.html#opt-levels
 
         # initialize training statistics
-        self.stats = self.TrainStatistics(
-            steps=0,
-            stop=False,
-            total_tokens=0,
-            best_ckpt_iter=0,
-            best_ckpt_score=np.inf if self.minimize_metric else -np.inf,
-            minimize_metric=self.minimize_metric,
-            early_stopping_patience=self.early_stopping_patience)
+        if not self.ddp:
+            self.stats = self.TrainStatistics(
+                steps=0,
+                stop=False,
+                total_tokens=0,
+                best_ckpt_iter=0,
+                best_ckpt_score=np.inf if self.minimize_metric else -np.inf,
+                minimize_metric=self.minimize_metric,
+                early_stopping_patience=self.early_stopping_patience)
 
         # model parameters
         if "load_model" in train_config.keys() and not self.ddp:
@@ -464,7 +465,15 @@ class TrainManager:
         self.device = torch.device(gpu)
         self.model.to(self.device)
         logger.info(f"Model wrapped")
-
+        # init stats for each process:
+        self.stats = self.TrainStatistics(
+            steps=0,
+            stop=False,
+            total_tokens=0,
+            best_ckpt_iter=0,
+            best_ckpt_score=np.inf if self.minimize_metric else -np.inf,
+            minimize_metric=self.minimize_metric,
+            early_stopping_patience=self.early_stopping_patience)
         if "load_model" in self.train_config.keys():
             self.init_from_checkpoint(
                 self.train_config["load_model"],
