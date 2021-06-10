@@ -515,9 +515,8 @@ class TrainManager:
             self.tb_writer.add_histogram("train/utilities_histogram", u_h,
                                          self.stats.steps)
             if self.use_wandb:
-                print(f'u_h is {u_h.shape}')
+                logger.info(f'u_h is {u_h.shape}')
                 log_dict["train/utilities_histogram"] = wandb.Histogram(u_h)
-                log_dict["train/utilities_histogram"] = wandb.Histogram([1, 2, 3])
                 # print(f"is u_h in log_dict? {log_dict['train/utilities_histogram']}")
                 wandb.log(log_dict)
 
