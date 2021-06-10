@@ -148,7 +148,7 @@ class TrainManager:
             maxlen=train_config.get("keep_last_ckpts", 5))
         self.eval_metric = train_config.get("eval_metric", "bleu")
         if self.eval_metric not in [
-            'bleu', 'chrf', 'token_accuracy', 'sequence_accuracy'
+            'bleu', 'chrf', 'token_accuracy', 'sequence_accuracy', ''
         ]:
             raise ConfigurationError("Invalid setting for 'eval_metric', "
                                      "valid options: 'bleu', 'chrf', "
@@ -779,7 +779,7 @@ class TrainManager:
         if type(score) == torch.Tensor:
             tensor_score = score.detach().clone().to(self.device)
         else:
-            tensor_score = torch.tensor(score, device=self.device)
+            tensor_score = torch.tensor(score, device=self.device, dtype=torch.float)
         # create a list that will hold synchronised score
         score_list = [torch.zeros_like(tensor_score) for _ in range(self.world_size)]
         # put all the tensors across the machines in the appropriate positions
@@ -796,7 +796,7 @@ class TrainManager:
         # for perplexity = e^{-logP/N} = \prod_i^W e^{-logP_i/N_i} = e^{\sum_i^W -logP_i/N_i}
         elif reduce_type == "prod":
             reduced = torch.prod(stacked_list)
-        return float(reduced)
+        return reduced.item()
 
     def _validate(self, valid_data, epoch_no, track_mbr=False):
         valid_start_time = time.time()

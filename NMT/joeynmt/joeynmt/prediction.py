@@ -230,12 +230,15 @@ def validate_on_data(model: Model, data: Dataset,
             elif eval_metric.lower() == 'meteor':
                 current_valid_score = meteor_utility(
                     valid_hypotheses, valid_references)
+            else:
+                current_valid_score = -1
             # compute utility
             if utility_type is not None:
-                logger.info(f"Utility type {utility_type}")
+                # logger.info(f"Utility type {utility_type}")
                 reduced_utility, utility_per_sentence = get_utility_of_samples(utility_type, valid_hypotheses,
-                                                                               valid_references, reduce_type="sum",
+                                                                               valid_references, reduce_type="mean",
                                                                                save_utility_per_sentence=save_utility_per_sentence)
+                logger.info("Computed utility")
             # todo save utility per sentence
         else:
             current_valid_score = -1
@@ -604,11 +607,9 @@ def beer_utility(candidate, sample):
 
 def get_utility_fn(utility_type):
     if utility_type == "editdistance":
-        logger.info('Utility is actually editdistance')
         utility_fn = editdistance.eval
     elif utility_type == "beer":
         from mbr_nmt.utility import parse_utility
-        logger.info('Utility is totally beer')
         utility_fn = parse_utility('beer', lang='en')
     elif utility_type == "meteor":
         from mbr_nmt.utility import parse_utility
