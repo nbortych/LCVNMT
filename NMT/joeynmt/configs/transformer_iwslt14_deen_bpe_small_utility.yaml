@@ -23,7 +23,7 @@ testing:
   num_samples: 3
   save_utility_per_sentence: False
 training:
-  load_model: "models/iwslt14-deen-bpe-transformer_test/1.ckpt"
+#  load_model: "models/iwslt14-deen-bpe-transformer_test/4.ckpt"
   random_seed: 42
   optimizer: "adam"
   normalization: "tokens"
@@ -42,8 +42,8 @@ training:
   epochs: 4
   validation_freq: 100
   logging_freq: 10
-  eval_metric: "bleu"
-  model_dir: "models/iwslt14-deen-bpe-transformer_test_checkpoint"
+  eval_metric: ""
+  model_dir: "models/iwslt14-deen-bpe-transformer_test"#_checkpoint"
   overwrite: True
   shuffle: True
   use_cuda: True

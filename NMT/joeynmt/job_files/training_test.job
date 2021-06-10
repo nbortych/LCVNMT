@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:2
 #SBATCH --job-name=DDP
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=3
+#SBATCH --cpus-per-task=4
 #SBATCH --time=00:10:00
 #SBATCH --mem=32000M
 #SBATCH --output=../slurm/slurm_output_%A_training_test_ddp_gpu.out
@@ -24,15 +24,15 @@ cd ..
 
 # Your job starts in the directory where you call sbatch
 cd $HOME/joeynmt
+
 pip install --user -r requirements.txt
 pip install --user --editable .
 pip install --user wandb
-wandb login
+pip install --user ../mbr-nmt/
 
-
-# Activate your environment
-# source activate ...
-# Install things
+# BEER utility
+export BEER_HOME=./beer_2.0
+chmod +x ./beer_2.0/scripts/interactive
 
 # Run your code
 srun python -m joeynmt train configs/transformer_iwslt14_deen_bpe_small_utility.yaml #
