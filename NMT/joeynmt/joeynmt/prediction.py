@@ -245,7 +245,7 @@ def validate_on_data(model: Model, data: Dataset,
 
     return current_valid_score, valid_loss, valid_ppl, valid_sources, \
            valid_sources_raw, valid_references, valid_hypotheses, \
-           decoded_valid, valid_attention_scores, reduced_utility
+           decoded_valid, valid_attention_scores, reduced_utility, utility_per_sentence
 
 
 def parse_test_args(cfg, mode="test"):
@@ -409,7 +409,7 @@ def test(cfg_file,
 
         # pylint: disable=unused-variable
         score, loss, ppl, sources, sources_raw, references, hypotheses, \
-        hypotheses_raw, attention_scores, utility = validate_on_data(
+        hypotheses_raw, attention_scores, utility, utility_per_sentence = validate_on_data(
             model, data=data_set, batch_size=batch_size,
             batch_class=batch_class, batch_type=batch_type, level=level,
             max_output_length=max_output_length, eval_metric=eval_metric,
@@ -496,7 +496,7 @@ def translate(cfg_file: str,
         """ Translates given dataset, using parameters from outer scope. """
         # pylint: disable=unused-variable
         score, loss, ppl, sources, sources_raw, references, hypotheses, \
-        hypotheses_raw, attention_scores, utility = validate_on_data(
+        hypotheses_raw, attention_scores, utility, utility_per_sentence = validate_on_data(
             model, data=test_data, batch_size=batch_size,
             batch_class=batch_class, batch_type=batch_type, level=level,
             max_output_length=max_output_length, eval_metric="",

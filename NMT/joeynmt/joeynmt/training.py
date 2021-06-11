@@ -185,6 +185,8 @@ class TrainManager:
 
         # eval options
         test_config = config["testing"]
+        self.test_config = test_config.copy()
+        self.save_utility_per_sentence = test_config.get('save_utility_per_sentence', False)
         self.bpe_type = test_config.get("bpe_type", "subword-nmt")
         self.sacrebleu = {"remove_whitespace": True, "tokenize": "13a"}
         if "sacrebleu" in config["testing"].keys():
@@ -793,7 +795,7 @@ class TrainManager:
             float representing the reduced score
 
         """
-        valid_reduce_types = ["mean", "sum", "prod"]
+        valid_reduce_types = ["mean", "sum", "prod", None]
         assert reduce_type in valid_reduce_types, \
             f"Please make sure to use reduce_type argument from {valid_reduce_types} for synchronisation."
         # if the score is tensor, clone it, otherwise create a tensor of it
@@ -817,6 +819,8 @@ class TrainManager:
         # for perplexity = e^{-logP/N} = \prod_i^W e^{-logP_i/N_i} = e^{\sum_i^W -logP_i/N_i}
         elif reduce_type == "prod":
             reduced = torch.prod(stacked_list)
+        elif reduce_type is None:
+            return stacked_list.cpu().numpy()
         return reduced.item()
 
     # def _synch_reduce_ddp(self, score, reduce_type="mean"):
@@ -840,7 +844,7 @@ class TrainManager:
         valid_start_time = time.time()
         valid_score, valid_loss, valid_ppl, valid_sources, \
         valid_sources_raw, valid_references, valid_hypotheses, \
-        valid_hypotheses_raw, valid_attention_scores, valid_utility = \
+        valid_hypotheses_raw, valid_attention_scores, valid_utility, utility_per_sentence = \
             validate_on_data(
                 batch_size=self.eval_batch_size,
                 batch_class=self.batch_class,
@@ -860,7 +864,8 @@ class TrainManager:
                 mbr=True if track_mbr else False,
                 utility_type=self.utility_type,
                 rank=self.rank,
-                world_size=self.world_size
+                world_size=self.world_size,
+                save_utility_per_sentence=self.save_utility_per_sentence
             )
 
         # synchronise+reduce valid scores between the processess
@@ -873,6 +878,8 @@ class TrainManager:
                 valid_score = self._synch_reduce_ddp(valid_score, reduce_type="mean")
             valid_ppl = self._synch_reduce_ddp(valid_ppl, reduce_type="mean")
             valid_utility = self._synch_reduce_ddp(valid_utility, reduce_type="mean")
+            if self.save_utility_per_sentence:
+                utility_per_sentence = self._synch_reduce_ddp(utility_per_sentence, reduce_type=None)
 
         if not self.ddp or self.rank == 0:
             for name, score in zip(["valid_loss", "valid_score", "valid_ppl", "valid_utility"],
@@ -884,6 +891,11 @@ class TrainManager:
                                           self.stats.steps)
                 if self.use_wandb:
                     wandb.log({f"valid/{valid_type_str}/{name}": score})
+            if self.save_utility_per_sentence:
+                self.tb_writer.add_histogram(f"valid/{valid_type_str}/utility_per_sentence", utility_per_sentence,
+                                             self.stats.steps)
+                if self.use_wandb:
+                    wandb.log({f"valid/{valid_type_str}/utility_per_sentence": wandb.Histogram(utility_per_sentence)})
 
         if self.early_stopping_metric == "loss":
             ckpt_score = valid_loss
