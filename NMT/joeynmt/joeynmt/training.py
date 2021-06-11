@@ -212,6 +212,9 @@ class TrainManager:
         self.batch_size = train_config["batch_size"]
         self.early_stopping = train_config.get("early_stopping", True)
         self.early_stopping_patience = train_config.get("early_stopping_patience", 10)
+        # do not stop training untill we early stop
+        if self.early_stopping:
+            self.epochs == sys.maxsize * 5
         # Placeholder so that we can use the train_iter in other functions.
         self.dataloader = None
         self.train_iter_state = None
