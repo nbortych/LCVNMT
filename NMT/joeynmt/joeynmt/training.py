@@ -819,10 +819,25 @@ class TrainManager:
             reduced = torch.prod(stacked_list)
         return reduced.item()
 
+    # def _synch_reduce_ddp(self, score, reduce_type="mean"):
+    #     if type(score) == torch.Tensor:
+    #         tensor_score = score.detach().clone().to(self.device)
+    #     else:
+    #         tensor_score = torch.tensor(score, device=self.device, dtype=torch.float)
+    #     dist.all_reduce(tensor_score)
+    #     tensor_score = tensor_score / self.world_size
+    #     return tensor_score
+
     def _validate(self, valid_data, epoch_no, track_mbr=False):
+        # search method for validation
         valid_type_str = 'mbr' if track_mbr else 'greedy'
         # based on what type of search to make decisions on
         # if mbr is being tracked, use that, otherwise, greedy will suffice
+        if getattr(self, 'track_mbr', False):
+            make_decision = True if track_mbr else False
+        else:
+            make_decision = False if track_mbr else True
+        valid_start_time = time.time()
         valid_score, valid_loss, valid_ppl, valid_sources, \
         valid_sources_raw, valid_references, valid_hypotheses, \
         valid_hypotheses_raw, valid_attention_scores, valid_utility = \
@@ -854,13 +869,21 @@ class TrainManager:
             # todo compute bleu + sentence level utility histogram validation
             # utility average
             valid_loss = self._synch_reduce_ddp(valid_loss, reduce_type="mean")
-            if self.eval_metric!='':
+            if self.eval_metric != '':
                 valid_score = self._synch_reduce_ddp(valid_score, reduce_type="mean")
             valid_ppl = self._synch_reduce_ddp(valid_ppl, reduce_type="mean")
             valid_utility = self._synch_reduce_ddp(valid_utility, reduce_type="mean")
 
         if not self.ddp or self.rank == 0:
             for name, score in zip(["valid_loss", "valid_score", "valid_ppl", "valid_utility"],
+                                   [valid_loss, valid_score, valid_ppl, valid_utility]):
+                # don't log, if not computed
+                if self.eval_metric == '' and name == 'valid_score':
+                    continue
+                self.tb_writer.add_scalar(f"valid/{valid_type_str}/{name}", score,
+                                          self.stats.steps)
+                if self.use_wandb:
+                    wandb.log({f"valid/{valid_type_str}/{name}": score})
 
         if self.early_stopping_metric == "loss":
             ckpt_score = valid_loss
@@ -871,39 +894,16 @@ class TrainManager:
         else:
             ckpt_score = valid_score
 
-        if self.scheduler is not None and self.scheduler_step_at == "validation" and not track_mbr:
+        if self.scheduler is not None and self.scheduler_step_at == "validation" and make_decision:
             self.scheduler.step(ckpt_score)
 
         # early stopping of the training
-        if self.early_stopping and not track_mbr:
+        if self.early_stopping and make_decision:
             self.stats.early_stopping_step(ckpt_score)
-
-        # # making sure that all processess stop
-        # stop_tensor = torch.tensor(0, device = self.device)
-        # if self.ddp:
-        #     # checking if the first rank has reached the stopping criteria
-        #     stop_tensor = torch.tensor(1, device = self.device) if self.stats.stop else torch.tensor(0, device = self.device)
-        #     # reducing across all the dimensions
-        #     dist.all_reduce(stop_tensor, op=dist.ReduceOp.SUM)
-        #     if stop_tensor >= 1:
-        #         self.stats.stop = True
-        # logging
-        if not self.ddp or self.rank == 0:
-            logger.info(f"Got to logging validation {self.rank} {valid_type_str}")
-
-            for name, score in zip(["valid_loss", "valid_score", "valid_ppl", "valid_utility"],
-                                   [valid_loss, valid_score, valid_ppl, valid_utility]):
-                self.tb_writer.add_scalar(f"valid/{name}", score,
-                                          self.stats.steps)
-                if self.use_wandb:
-                    wandb.log({f"valid/{name}": score})
-            logger.info(f"Finished logging validation {self.rank} {valid_type_str}")
-        isBest = self.stats.is_best(ckpt_score, self.rank, track_mbr)
-        logger.info(f"Finished is BEST validation {self.rank} {valid_type_str} {isBest}")
 
         # checkpointing
         new_best = False
-        if self.stats.is_best(ckpt_score) and (not self.ddp or self.rank == 0):
+        if make_decision and self.stats.is_best(ckpt_score) and (not self.ddp or self.rank == 0):
             self.stats.best_ckpt_score = ckpt_score
             self.stats.best_ckpt_iter = self.stats.steps
             logger.info('Hooray! New best validation result [%s]!',
@@ -912,8 +912,7 @@ class TrainManager:
                 logger.info("Saving new checkpoint.")
                 new_best = True
                 self._save_checkpoint(new_best)
-                if self.child_conn is not None:
-        elif self.save_latest_checkpoint and (not self.ddp or self.rank == 0):
+        elif self.save_latest_checkpoint and (not self.ddp or self.rank == 0) and make_decision:
             self._save_checkpoint(new_best)
 
         if not self.ddp or self.rank == 0:
@@ -946,7 +945,7 @@ class TrainManager:
         self._store_outputs(valid_hypotheses, mbr=track_mbr)
 
         # store attention plots for selected valid sentences
-        if valid_attention_scores:
+        if valid_attention_scores and make_decision:
             store_attention_plots(attentions=valid_attention_scores,
                                   targets=valid_hypotheses_raw,
                                   sources=[s for s in valid_data.src],
@@ -1066,7 +1065,7 @@ class TrainManager:
                      best_ckpt_iter: int = 0,
                      best_ckpt_score: float = np.inf,
                      minimize_metric: bool = True,
-                     early_stopping_patience=False) -> None:
+                     early_stopping_patience=5) -> None:
             # global update step counter
             self.steps = steps
             # stop training if this flag is True
