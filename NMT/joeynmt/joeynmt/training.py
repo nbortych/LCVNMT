@@ -147,7 +147,6 @@ class TrainManager:
         self.ckpt_queue = collections.deque(
             maxlen=train_config.get("keep_last_ckpts", 5))
         self.eval_metric = train_config.get("eval_metric", "bleu")
-        logger.info(f"Eval metric is {self.eval_metric} , {'!'*100}")
         if self.eval_metric not in [
             'bleu', 'chrf', 'token_accuracy', 'sequence_accuracy', ''
         ]:
@@ -455,7 +454,6 @@ class TrainManager:
 
     def init_ddp(self, gpu, train_data, child_conn):
         logger.info(f"Got into training, gpu is {gpu}")
-        print(f"Got into training, gpu is {gpu}")
         self.rank = self.node_nr * self.n_gpu + gpu
         dist.init_process_group(
             backend='nccl',  # gloo
@@ -532,9 +530,8 @@ class TrainManager:
         :param train_data: training data
         :param valid_data: validation data
         """
-        logger.info(f'gpu {gpu}')
-        # print(f'gpu {gpu}')
-        logger.info("Initialised")
+
+        logger.info(f'Initialised {"gpu" if torch.cuda.is_available() else "cpu"} {gpu}')
         # if small test run, use subset of the data that is one batch
         if self.small_test_run:
             train_data = self.make_small_data(train_data)
@@ -696,7 +693,7 @@ class TrainManager:
                     epoch_duration = time.time() - start - total_valid_duration + epoch_duration
 
                     logger.info(
-                        f"End of epoch {epoch_no + 1}, it took {epoch_duration:.3f}. Epoch loss is {epoch_loss:.4f}")
+                    f"End of epoch {epoch_no + 1}, it took {epoch_duration:.3f}. Epoch loss is {epoch_loss:.4f}. "
 
             # validate at the end of epoch if small
             if self.small_test_run:
@@ -819,7 +816,7 @@ class TrainManager:
     def _validate(self, valid_data, epoch_no, track_mbr=False):
         valid_type_str = 'mbr' if track_mbr else 'greedy'
         valid_start_time = time.time() if not self.ddp or self.rank == 0 else 0
-        logger.info(f"Validation by {valid_type_str} decoding. rank {self.rank}")
+        # if mbr is being tracked, use that, otherwise, greedy will suffice
         valid_score, valid_loss, valid_ppl, valid_sources, \
         valid_sources_raw, valid_references, valid_hypotheses, \
         valid_hypotheses_raw, valid_attention_scores, valid_utility = \
@@ -846,26 +843,18 @@ class TrainManager:
             )
 
         # synchronise+reduce valid scores between the processess
-        logger.info(f"Synchronising {self.rank} {valid_type_str}" )
-        # torch.cuda.synchronize()
         if self.ddp:
-            # for name, score in zip(["valid_loss", "valid_score", "valid_ppl", "valid_utility"],
-            #                        [valid_loss, valid_score, valid_ppl, valid_utility]):
-            #     print(f"name {name}, score {score} ")
             # todo normalise loss in predict
             # todo compute bleu + sentence level utility histogram validation
             # utility average
-            logger.info(f"Synchronising {self.rank} {valid_type_str} valid loss {valid_loss}" )
             valid_loss = self._synch_reduce_ddp(valid_loss, reduce_type="mean")
             if self.eval_metric!='':
                 valid_score = self._synch_reduce_ddp(valid_score, reduce_type="mean")
-            logger.info(f"Synchronising {self.rank} {valid_type_str}, valid loss {valid_loss}, valid ppl {valid_ppl}" )
             valid_ppl = self._synch_reduce_ddp(valid_ppl, reduce_type="mean")
-            logger.info(f"Synchronising {self.rank} {valid_type_str}, valid_ppl {valid_ppl}, valid_utility {valid_utility}" )
             valid_utility = self._synch_reduce_ddp(valid_utility, reduce_type="mean")
-            logger.info(f"Synchronising {self.rank} {valid_type_str}, valid_utility {valid_utility}" )
-        logger.info(f"Valid utility is {valid_utility}, rank {self.rank} {valid_type_str}")
-        logger.info(f"Synchronized {self.rank} {valid_type_str}")
+
+        if not self.ddp or self.rank == 0:
+            for name, score in zip(["valid_loss", "valid_score", "valid_ppl", "valid_utility"],
 
         if self.early_stopping_metric == "loss":
             ckpt_score = valid_loss
@@ -878,13 +867,10 @@ class TrainManager:
 
         if self.scheduler is not None and self.scheduler_step_at == "validation" and not track_mbr:
             self.scheduler.step(ckpt_score)
-            logger.info(f"Scheduler step {self.rank} {valid_type_str}" )
 
         # early stopping of the training
         if self.early_stopping and not track_mbr:
-            logger.info(f"early stopping {self.rank} {valid_type_str}")
             self.stats.early_stopping_step(ckpt_score)
-            logger.info(f"done early stopping {self.rank} {valid_type_str}")
 
         # # making sure that all processess stop
         # stop_tensor = torch.tensor(0, device = self.device)
@@ -912,7 +898,6 @@ class TrainManager:
         # checkpointing
         new_best = False
         if self.stats.is_best(ckpt_score) and (not self.ddp or self.rank == 0):
-            logger.info(f"Got to the beggining of saving rank {rank} {valid_type_str}")
             self.stats.best_ckpt_score = ckpt_score
             self.stats.best_ckpt_iter = self.stats.steps
             logger.info('Hooray! New best validation result [%s]!',
@@ -920,16 +905,13 @@ class TrainManager:
             if self.ckpt_queue.maxlen > 0:
                 logger.info("Saving new checkpoint.")
                 new_best = True
-                logger.info(f"savin maxlen>0 rank {rank} {valid_type_str}")
                 self._save_checkpoint(new_best)
                 if self.child_conn is not None:
                     logger.info(f"child connection {rank} {valid_type_str}")
                     self.child_conn.send(self.stats.best_ckpt_iter)
                     logger.info(f"child connection done {rank}")
         elif self.save_latest_checkpoint and (not self.ddp or self.rank == 0):
-            logger.info(f"save latest {rank} {valid_type_str}")
             self._save_checkpoint(new_best)
-        logger.info(f"Finished saving step {self.rank} {valid_type_str}")
 
         if not self.ddp or self.rank == 0:
             # append to validation report
@@ -940,7 +922,6 @@ class TrainManager:
                              new_best=new_best,
                              utility=valid_utility,
                              mbr=track_mbr)
-            logger.info(f"Report step {self.rank} {valid_type_str}")
 
         if not self.small_test_run:
             self._log_examples(sources_raw=[v for v in valid_sources_raw],
@@ -1109,11 +1090,8 @@ class TrainManager:
             # reason for stopping
             self.early_stopping = False
 
-        def is_best(self, score, rank = None, track_mbr = None):
-            logger.info(f"Comparing {rank} {'mbr' if track_mbr else 'greedy'} ")
+        def is_best(self, score):
             is_best = self.comparison(score, self.best_ckpt_score)
-            logger.info(f"Compared {rank} {'mbr' if track_mbr else 'greedy'} ")
-
             return is_best
 
         def early_stopping_step(self, score):
@@ -1190,7 +1168,7 @@ def train(cfg_file: str) -> None:
         last_checkpoint = parent_conn.recv()
         i = 0
         while parent_conn.poll():
-            logger.info(f"Parent connection {i} got {parent_conn.recv()}")
+            logger.info(f"Parent connection {i} got {parent_conn.recv()}, last checkpoint is {last_checkpoint}")
             i += 1
         trainer.stats.best_ckpt_iter = last_checkpoint
     else:

@@ -234,11 +234,9 @@ def validate_on_data(model: Model, data: Dataset,
                 current_valid_score = -1
             # compute utility
             if utility_type is not None:
-                # logger.info(f"Utility type {utility_type}")
                 reduced_utility, utility_per_sentence = get_utility_of_samples(utility_type, valid_hypotheses,
                                                                                valid_references, reduce_type="mean",
                                                                                save_utility_per_sentence=save_utility_per_sentence)
-                logger.info("Computed utility")
             # todo save utility per sentence
         else:
             current_valid_score = -1
