@@ -171,7 +171,13 @@ class TrainManager:
             else:
                 self.minimize_metric = True
         elif self.early_stopping_metric == "utility":
-            self.minimize_metric = False
+            if self.utility_type == "beer":
+                self.minimize_metric = False
+            elif self.utility_type == "editdistance":
+                self.minimize_metric = True
+            else:
+                raise ConfigurationError(
+                    f"utility_type must be in one of [beer, editdistance]. It is currently {self.utility_type}")
         else:
             raise ConfigurationError(
                 "Invalid setting for 'early_stopping_metric', "
