@@ -473,14 +473,7 @@ class TrainManager:
         self.model.to(self.device)
         logger.info(f"Model wrapped")
         # init stats for each process:
-        self.stats = self.TrainStatistics(
-            steps=0,
-            stop=False,
-            total_tokens=0,
-            best_ckpt_iter=0,
-            best_ckpt_score=np.inf if self.minimize_metric else -np.inf,
-            minimize_metric=self.minimize_metric,
-            early_stopping_patience=self.early_stopping_patience)
+
         if "load_model" in self.train_config.keys():
             self.init_from_checkpoint(
                 self.train_config["load_model"],
@@ -547,7 +540,6 @@ class TrainManager:
         # if Distributed Data Parallel
         if self.ddp:
             self.init_ddp(gpu, train_data, child_conn)
-            # logger = logging.getLogger(__name__)
         else:
             self.batch_sampler = BatchSamplerSimilarLength(train_data, self.batch_size, shuffle=self.shuffle)
             self.tb_writer = SummaryWriter(log_dir=self.model_dir + "/tensorboard/")
