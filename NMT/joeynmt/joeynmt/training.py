@@ -943,7 +943,7 @@ class TrainManager:
                 0 if self.rank is None else self.rank)
 
         # store validation set outputs
-        self._store_outputs(valid_hypotheses)
+        self._store_outputs(valid_hypotheses, mbr=track_mbr)
 
         # store attention plots for selected valid sentences
         if valid_attention_scores:
@@ -1043,17 +1043,17 @@ class TrainManager:
             logger.info("\tReference:  %s", references[p])
             logger.info("\tHypothesis: %s", hypotheses[p])
 
-    def _store_outputs(self, hypotheses: List[str]) -> None:
+    def _store_outputs(self, hypotheses: List[str], mbr=False) -> None:
         """
         Write current validation outputs to file in `self.model_dir.`
 
         :param hypotheses: list of strings
         """
 
-        current_valid_output_file = "{}/{}.hyps".format(self.model_dir,
-                                                    self.stats.steps if not self.ddp else
-                                                        f'{self.stats.steps}_{self.rank}')
-        
+        current_valid_output_file = "{}/{}_{}.hyps".format(self.model_dir,
+                                                           self.stats.steps,
+                                                           mbr)
+
         with open(current_valid_output_file, 'w') as opened_file:
             for hyp in hypotheses:
                 opened_file.write("{}\n".format(hyp))
