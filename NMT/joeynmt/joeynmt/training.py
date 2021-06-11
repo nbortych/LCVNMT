@@ -216,7 +216,7 @@ class TrainManager:
         self.early_stopping_patience = train_config.get("early_stopping_patience", 10)
         # do not stop training untill we early stop
         if self.early_stopping:
-            self.epochs == sys.maxsize * 5
+            self.epochs = sys.maxsize
         # Placeholder so that we can use the train_iter in other functions.
         self.dataloader = None
         self.train_iter_state = None
@@ -594,7 +594,7 @@ class TrainManager:
         if self.epochs == 0:
             epoch_no = 0
             self._save_checkpoint(True)
-
+        logger.info(f"Num epochs is {self.epochs}")
         for epoch_no in range(self.epoch_no, self.epochs):
             logger.info("EPOCH %d", epoch_no + 1)
 
@@ -723,9 +723,9 @@ class TrainManager:
 
         # send the best ckpt to the parent
         if self.child_conn is not None:
-            logger.info(f"child connection {self.rank}")
+            logger.info(f"child connection {self.rank}, best iter is {self.stats.best_ckpt_iter}")
             self.child_conn.send(self.stats.best_ckpt_iter)
-            logger.info(f"child connection done {self.rank}")
+            logger.info(f"child connection done {self.rank},  best iter is {self.stats.best_ckpt_iter}")
 
         if not self.ddp or self.rank == 0:
             self.tb_writer.close()  # close Tensorboard writer
@@ -915,12 +915,12 @@ class TrainManager:
 
         # checkpointing
         new_best = False
-        if make_decision and self.stats.is_best(ckpt_score) and (not self.ddp or self.rank == 0):
+        if make_decision and self.stats.is_best(ckpt_score):
             self.stats.best_ckpt_score = ckpt_score
             self.stats.best_ckpt_iter = self.stats.steps
             logger.info('Hooray! New best validation result [%s]!',
                         self.early_stopping_metric)
-            if self.ckpt_queue.maxlen > 0:
+            if self.ckpt_queue.maxlen > 0 and (not self.ddp or self.rank == 0):
                 logger.info("Saving new checkpoint.")
                 new_best = True
                 self._save_checkpoint(new_best)
@@ -1183,6 +1183,7 @@ def train(cfg_file: str) -> None:
         last_checkpoint = parent_conn.recv()
         i = 0
         while parent_conn.poll():
+            last_checkpoint = parent_conn.recv()
             logger.info(f"Parent connection {i} got {parent_conn.recv()}, last checkpoint is {last_checkpoint}")
             i += 1
         trainer.stats.best_ckpt_iter = last_checkpoint
