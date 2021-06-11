@@ -728,6 +728,12 @@ class TrainManager:
                     self.stats.best_ckpt_iter, self.stats.best_ckpt_score,
                     self.early_stopping_metric)
 
+        # send the best ckpt to the parent
+        if self.child_conn is not None:
+            logger.info(f"child connection {self.rank}")
+            self.child_conn.send(self.stats.best_ckpt_iter)
+            logger.info(f"child connection done {self.rank}")
+
         if not self.ddp or self.rank == 0:
             self.tb_writer.close()  # close Tensorboard writer
             if self.use_wandb:
@@ -916,9 +922,6 @@ class TrainManager:
                 new_best = True
                 self._save_checkpoint(new_best)
                 if self.child_conn is not None:
-                    logger.info(f"child connection {rank} {valid_type_str}")
-                    self.child_conn.send(self.stats.best_ckpt_iter)
-                    logger.info(f"child connection done {rank}")
         elif self.save_latest_checkpoint and (not self.ddp or self.rank == 0):
             self._save_checkpoint(new_best)
 
