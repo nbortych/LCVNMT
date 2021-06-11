@@ -1183,6 +1183,10 @@ def train(cfg_file: str) -> None:
     ckpt = "{}/{}.ckpt".format(model_dir, trainer.stats.best_ckpt_iter)
     output_name = "{:08d}.hyps".format(trainer.stats.best_ckpt_iter)
     output_path = os.path.join(model_dir, output_name)
+    # if after checkpointing things did not improve, then we can use the checkpoint
+    if not os.path.exists(output_path) and 'load_model' in trainer.train_config:
+        logger.info("After checkpointing, the model did not improve. Using checkpoint save")
+        output_path = trainer.train_config['load_model']
     datasets_to_test = {
         "dev": dev_data,
         "test": test_data,
