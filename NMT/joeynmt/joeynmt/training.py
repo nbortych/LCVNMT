@@ -603,7 +603,7 @@ class TrainManager:
 
             # Reset statistics for each epoch.
 
-            start = time.time() if not self.ddp or self.rank == 0 else 0
+            start = time.time()  # if not self.ddp or self.rank == 0 else 0
             epoch_duration = 0
             total_valid_duration = 0
             start_tokens = self.stats.total_tokens
@@ -657,19 +657,18 @@ class TrainManager:
                     if self.stats.steps % self.logging_freq == 0 or self.small_test_run:
                         if not self.ddp or self.rank == 0:
                             self._log_training(batch_loss, log_dict)
-                            elapsed = time.time() - start - total_valid_duration
+                        elapsed = time.time() - start - total_valid_duration
 
-                            elapsed_tokens = self.stats.total_tokens - start_tokens
-                            logger.info(
-                                "Epoch %3d, Step: %8d, Batch Loss: %12.6f, "
-                                "Tokens per Sec: %8.0f, Lr: %.6f", epoch_no + 1,
-                                self.stats.steps, batch_loss,
-                                                                   elapsed_tokens / elapsed,
-                                self.optimizer.param_groups[0]["lr"])
+                        elapsed_tokens = self.stats.total_tokens - start_tokens
+                        logger.info(
+                            f"Epoch {epoch_no + 1}, Step: {self.stats.steps}, Batch Loss: {batch_loss:.6f}, "
+                            f"Tokens per Sec: {elapsed_tokens / elapsed :.0f}, "
+                            f"LR: {self.optimizer.param_groups[0]['lr']:.6f}, rank {0 if self.rank is None else self.rank}"
+                        )
 
-                            epoch_duration += elapsed
+                        epoch_duration += elapsed
 
-                        start = time.time() if not self.ddp or self.rank == 0 else 0
+                        start = time.time()  # if not self.ddp or self.rank == 0 else 0
                         total_valid_duration = 0
                         start_tokens = self.stats.total_tokens
 
@@ -689,11 +688,12 @@ class TrainManager:
                     break
 
             else:
-                if not self.ddp or self.rank == 0:
-                    epoch_duration = time.time() - start - total_valid_duration + epoch_duration
+                # if not self.ddp or self.rank == 0:
+                epoch_duration = time.time() - start - total_valid_duration + epoch_duration
 
-                    logger.info(
+                logger.info(
                     f"End of epoch {epoch_no + 1}, it took {epoch_duration:.3f}. Epoch loss is {epoch_loss:.4f}. "
+                    f"Rank is {0 if self.rank is None else self.rank}")
 
             # validate at the end of epoch if small
             if self.small_test_run:
@@ -821,7 +821,7 @@ class TrainManager:
 
     def _validate(self, valid_data, epoch_no, track_mbr=False):
         valid_type_str = 'mbr' if track_mbr else 'greedy'
-        valid_start_time = time.time() if not self.ddp or self.rank == 0 else 0
+        # based on what type of search to make decisions on
         # if mbr is being tracked, use that, otherwise, greedy will suffice
         valid_score, valid_loss, valid_ppl, valid_sources, \
         valid_sources_raw, valid_references, valid_hypotheses, \
@@ -933,13 +933,14 @@ class TrainManager:
                                hypotheses=valid_hypotheses,
                                references=valid_references)
 
-        valid_duration = time.time() - valid_start_time if not self.ddp or self.rank == 0 else 0
+        valid_duration = time.time() - valid_start_time  # if not self.ddp or self.rank == 0 else 0
         if not self.ddp or self.rank == 0:
             logger.info(
                 f'Validation result (%s) at epoch %3d, '
                 'step %8d: %s: %6.2f, loss: %8.4f, ppl: %8.4f,  utility %s:%8.2f '
-                'duration: %.4fs', valid_type_str, epoch_no + 1, self.stats.steps, self.eval_metric,
-                valid_score, valid_loss, valid_ppl, self.utility_type, valid_utility, valid_duration)
+                'duration: %.4fs, rank %2d', valid_type_str, epoch_no + 1, self.stats.steps, self.eval_metric,
+                valid_score, valid_loss, valid_ppl, self.utility_type, valid_utility, valid_duration,
+                0 if self.rank is None else self.rank)
 
         # store validation set outputs
         self._store_outputs(valid_hypotheses)
