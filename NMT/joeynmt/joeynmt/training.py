@@ -213,9 +213,10 @@ class TrainManager:
         self.epoch_no = 0
         self.batch_size = train_config["batch_size"]
         self.early_stopping = train_config.get("early_stopping", True)
+        self.validation_stopping = train_config.get("validation_stopping", False)
         self.early_stopping_patience = train_config.get("early_stopping_patience", 10)
         # do not stop training untill we early stop
-        if self.early_stopping:
+        if self.validation_stopping:
             self.epochs = sys.maxsize
         # Placeholder so that we can use the train_iter in other functions.
         self.dataloader = None
