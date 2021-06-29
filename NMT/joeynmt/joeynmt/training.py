@@ -494,7 +494,8 @@ class TrainManager:
             self.model.loss_function._utility_fn = get_utility_fn(self.utility_type)
 
         if self.distributed_batch_sampler:
-            self.batch_sampler = DistributedBatchSamplerSimilarLength(train_data, self.batch_size)
+            self.batch_sampler = DistributedBatchSamplerSimilarLength(train_data, num_replicas=self.world_size,
+                                                                      rank=self.rank, batch_size=self.batch_size)
         else:
             self.train_sampler = DistributedSampler(train_data, num_replicas=self.world_size,
                                                     rank=self.rank)

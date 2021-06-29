@@ -9,6 +9,7 @@ import os
 import os.path
 from typing import Optional
 import logging
+import copy
 
 import torch
 from torch.utils.data import Dataset, DataLoader, Sampler
@@ -202,10 +203,10 @@ class BatchSamplerSimilarLength(Sampler):
         self.batch_size = batch_size
         self.shuffle = shuffle
         # get the indicies and length
-        self.indices = [(i, src_len) for i, (src, src_len, trg, trg_len) in enumerate(dataset)]
-        # if indices are passed, then use only the ones passed (for ddp)
-        if indices is not None:
-            self.indices = torch.tensor(self.indices)[indices].tolist()
+        if indices is None:
+            self.indices = [(i, src_len) for i, (src, src_len, trg, trg_len) in enumerate(dataset)]
+        else:
+            self.indices = indices
 
     def __iter__(self):
         if self.shuffle:
@@ -237,9 +238,16 @@ class DistributedBatchSamplerSimilarLength(DistributedSampler):
         super().__init__(dataset=dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle, seed=seed,
                          drop_last=drop_last)
         self.batch_size = batch_size
+        self.indices = torch.tensor([(i, src_len) for i, (src, src_len, trg, trg_len) in enumerate(dataset)])
 
+        logger.info(f"indices length total {len(self.indices)}")
     def __iter__(self):
-        indices = list(super().__iter__())
+        # get indices that will be processed by this rank
+        indices_on_this_rank = list(super().__iter__())
+        logger.info(f"indices length subset on this rank {len(indices_on_this_rank)}")
+        # subsample full indices
+        indices = copy.deepcopy(self.indices[indices_on_this_rank].tolist())
+        logger.info(f"indices length subset {len(indices)}")
         batch_sampler = BatchSamplerSimilarLength(self.dataset, batch_size=self.batch_size, indices=indices)
         return iter(batch_sampler)
 
@@ -403,6 +411,7 @@ class DistributedEvalSampler(Sampler):
         indices = list(range(self.total_size))
         self.indices = indices[self.rank:self.total_size:self.num_replicas]
         self.num_samples = len(indices)             # true value without extra samples
+        logger.info(f"indices length validation  {len(self.indices)} total size {self.total_size}")
 
     def __iter__(self):
         return iter(self.indices)
