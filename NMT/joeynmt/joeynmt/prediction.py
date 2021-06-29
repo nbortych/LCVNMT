@@ -12,6 +12,8 @@ import editdistance
 
 import numpy as np
 import torch
+import multiprocessing as mp
+from multiprocessing.pool import ThreadPool
 from torchtext.legacy.data import Field
 from torch.utils.data import Dataset, Subset
 # from torch.utils.data.distributed import DistributedSampler
@@ -660,25 +662,57 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
 
     if mbr_type == "editdistance":
         # define utility function
+        # todo check if the java problem is due to this
         utility_fn = get_utility_fn(utility_type)
-        # transform indices to str
+        # transform indices to str [BxS]
         decoded_samples = [
             [' '.join(sample) for sample in model.trg_vocab.arrays_to_sentences(arrays=batch,
                                                                                 cut_at_eos=True)] for batch in samples]
         # initialise utility matrix [BxSxS]
-        U = torch.zeros([batch_size, num_samples, num_samples], dtype=torch.float) + 1e-10
-        # combination of all samples (since utility is symmetrical, we need only AB and not BA samples) [BxC]
-        batch_combinations_of_samples = [itertools.combinations(batch_samples, r=2) for batch_samples in
-                                         decoded_samples]
-        # computing utility of the samples [BxS]
-        utilities = torch.tensor([list(itertools.starmap(utility_fn, combinations_of_samples)) for
-                                  combinations_of_samples in batch_combinations_of_samples]).to(torch.float)
-        # lower triangular and upper indices of the matrix, below the diagonal, since distance(A,A) = 0
-        tril_indices = torch.tril_indices(row=num_samples, col=num_samples, offset=-1)
-        triu_indices = torch.triu_indices(row=num_samples, col=num_samples, offset=1)
-        # setting the values to the matrix [BxSxS]
-        U[:, tril_indices[0], tril_indices[1]] = utilities
-        U[:, triu_indices[0], triu_indices[1]] = utilities
+        # if symmetrical utility, do this
+        if utility_type == "editdistance":
+            U = torch.zeros([batch_size, num_samples, num_samples], dtype=torch.float) + 1e-10
+            # combination of all samples (since utility is symmetrical, we need only AB and not BA samples) [BxC]
+            batch_combinations_of_samples = [itertools.combinations(batch_samples, r=2) for batch_samples in
+                                             decoded_samples]
+            # computing utility of the samples [BxC]
+            utilities = torch.tensor([list(itertools.starmap(utility_fn, combinations_of_samples)) for
+                                      combinations_of_samples in batch_combinations_of_samples], dtype=torch.float)
+
+            # lower triangular and upper indices of the matrix, below the diagonal, since distance(A,A) = 0
+            tril_indices = torch.tril_indices(row=num_samples, col=num_samples, offset=-1)
+            triu_indices = torch.triu_indices(row=num_samples, col=num_samples, offset=1)
+            # setting the values to the matrix [BxSxS]
+            U[:, tril_indices[0], tril_indices[1]] = utilities
+            U[:, triu_indices[0], triu_indices[1]] = utilities
+        else:
+            # permutations of all samples [Bx(S^2)]
+            batch_combinations_of_samples = [itertools.product(batch_samples, repeat=2) for batch_samples in
+                                             decoded_samples]
+
+            # # computing utility of the samples [Bx(S^2)]
+            # [B*S^2]
+            def batch_call(batch_combinations_of_samples):
+                hyp_ref_batches = [zip(*batch) for batch in batch_combinations_of_samples]
+                hyp_batch, ref_batch = (), ()
+                for h, r in hyp_ref_batches:
+                    hyp_batch += h
+                    ref_batch += r
+                # logger.info(f"len {len(hyp_batch)}, {len(ref_batch)}, batch size {batch_size}, num samples{num_samples}")
+                utilities = torch.tensor([utility_fn.call_batch(hyp_batch, ref_batch)], dtype=torch.float)
+
+            # setting the values to the matrix [BxSxS]
+            # logger.info(" Using batch call")
+            if not small_test_run:
+                utilities = torch.tensor([list(itertools.starmap(utility_fn, combinations_of_samples)) for
+                                      combinations_of_samples in batch_combinations_of_samples], dtype=torch.float)
+            else:
+                with ThreadPool(4) as p:
+                    utilities = torch.tensor([list(p.starmap(utility_fn, combinations_of_samples)) for
+                                  combinations_of_samples in batch_combinations_of_samples], dtype=torch.float)
+
+            U = utilities.reshape(batch_size, num_samples, num_samples)
+            # logger.info(f"U {U.shape}")
         # compute utility per candidate [BxS]
         expected_uility = torch.mean(U, dim=-1)
         # get argmin_c of sum^S u(samples, c) (min because we want less edit distance) [B]
