@@ -19,7 +19,7 @@ from torch.utils.data import Dataset, Subset
 # from torch.utils.data.distributed import DistributedSampler
 
 from joeynmt.helpers import bpe_postprocess, load_config, make_logger, \
-    get_latest_checkpoint, load_checkpoint, store_attention_plots
+    get_latest_checkpoint, load_checkpoint, store_attention_plots, debug_memory
 from joeynmt.metrics import bleu, chrf, token_accuracy, sequence_accuracy
 from joeynmt.model import build_model, Model, _DataParallel
 from joeynmt.search import run_batch
@@ -112,7 +112,7 @@ def validate_on_data(model: Model, data: Dataset,
 
     # if small test run, use subset of the data that is one batch
     if small_test_run:
-        SMALL_DATA_SIZE = 6
+        SMALL_DATA_SIZE = 100
 
         val_subset_data, _ = torch.utils.data.random_split(data,
                                                            [SMALL_DATA_SIZE, len(data) - SMALL_DATA_SIZE],
@@ -148,7 +148,7 @@ def validate_on_data(model: Model, data: Dataset,
         total_nseqs = 0
         encoder_hidden, encoder_output = None, None
         # gather subset of data
-        for valid_batch in valid_dataloader:
+        for i, valid_batch in enumerate(valid_dataloader):
             # run as during training to get validation loss (e.g. xent)
 
             batch = batch_class(valid_batch, pad_index, use_cuda=use_cuda, device=model.device)
@@ -196,10 +196,11 @@ def validate_on_data(model: Model, data: Dataset,
         assert len(all_outputs) == len(data)
 
         if compute_loss and total_ntokens > 0:
-            # total validation loss
-            valid_loss = total_loss
             # exponent of token-level negative log prob
-            valid_ppl = torch.exp(total_loss / total_ntokens)
+            valid_ppl = torch.exp(total_loss / total_ntokens).item()
+            # total validation loss
+            valid_loss = total_loss.item()
+
         else:
             valid_loss = -1
             valid_ppl = -1
@@ -242,9 +243,6 @@ def validate_on_data(model: Model, data: Dataset,
                     list(decoded_valid), list(data.trg))
             elif eval_metric.lower() == 'sequence_accuracy':
                 current_valid_score = sequence_accuracy(
-                    valid_hypotheses, valid_references)
-            elif eval_metric.lower() == 'meteor':
-                current_valid_score = meteor_utility(
                     valid_hypotheses, valid_references)
             else:
                 current_valid_score = -1
@@ -605,18 +603,6 @@ def translate(cfg_file: str,
             except (KeyboardInterrupt, EOFError):
                 print("\nBye.")
                 break
-
-
-def meteor_utility(candidate, sample):
-    from mbr_nmt.utility import parse_utility
-    utility_fn = parse_utility('meteor', lang='en')
-    return utility_fn(hyp=candidate, ref=sample)
-
-
-def beer_utility(candidate, sample):
-    from mbr_nmt.utility import parse_utility
-    utility_fn = parse_utility('beer', lang='en')
-    return utility_fn(hyp=candidate, ref=sample)
 
 
 def get_utility_fn(utility_type):
