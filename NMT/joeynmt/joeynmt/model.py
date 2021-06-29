@@ -75,8 +75,6 @@ class Model(nn.Module):
 
         :param return_type: one of {"loss", "encode", "decode"}
         """
-        # print(f"Running model with {return_type}")
-
         if return_type is None:
             raise ValueError("Please specify return_type: "
                              "{`loss`, `encode`, `decode`}.")
@@ -84,13 +82,7 @@ class Model(nn.Module):
         return_tuple = (None, None, None, None)
         if return_type == "loss":
             assert self.loss_function is not None
-            # logger.info(f"Batch shape {kwargs['src'].shape}, src mask {kwargs['src_mask'].shape}, src length {kwargs['src_length']}")
-            # out, hidden, _, _ = self._encode_decode(**kwargs)
             # encode and decode explicitly to save encoded for sampling
-            # for key, item in kwargs.items():
-            #     logger.info(f"{key}, {item}")
-            #     if hasattr(item, "device"):
-            #         logger.info(f"Device is {item.device}")
             encoder_output, encoder_hidden = self._encode(**kwargs)
             unroll_steps = kwargs['trg_input'].size(1)
             out, hidden, _, _ = self._decode(encoder_output=encoder_output, encoder_hidden=encoder_hidden,
@@ -104,14 +96,19 @@ class Model(nn.Module):
             if utility_reg:
                 # todo pass encode batch to save computations
                 batch_loss, log_dict = self.loss_function.utility_loss(model=self,
-                                                                            batch=kwargs['batch'],
-                                                                            batch_loss=batch_loss,
-                                                                            utility_type = kwargs['utility_type'])
+                                                                       batch=kwargs['batch'],
+                                                                       batch_loss=batch_loss,
+                                                                       utility_type=kwargs['utility_type'])
 
             else:
                 log_dict = {"nll": batch_loss.item(), "utility_term": None, "u_h": None}
 
-            return_tuple = (batch_loss, log_dict, None, None)
+            return_tuple = (batch_loss, log_dict)
+            # add the encoded batch to output
+            if kwargs.get("return_encoded", False):
+                return_tuple += (encoder_output, encoder_hidden)
+            else:
+                return_tuple += (None, None)
 
         elif return_type == "encode":
             encoder_output, encoder_hidden = self._encode(**kwargs)

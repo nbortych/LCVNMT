@@ -40,6 +40,8 @@ class XentLoss(nn.Module):
         # running average container for the mean baseline
         self._utility_running_average = 0
         self._utility_step = 0
+        # initialise utility fn once
+        self._utility_fn = None
 
     def utility_loss(self, model, batch, batch_loss, utility_type='editdistance'):
         log_dict = {"nll": batch_loss.item()}
@@ -52,7 +54,7 @@ class XentLoss(nn.Module):
                                              mbr_type="editdistance", utility_type=utility_type,
                                              return_types=("utilities", "log_probabilities"),
                                              need_grad=True, compute_log_probs=True,
-                                             encoded_batch=None)
+                                             encoded_batch=None, utility_fn=self._utility_fn)
 
         # log_uh = torch.log(u_h).detach()
         log_dict['u_h'] = u_h.detach().clone().mean(dim=1).numpy()

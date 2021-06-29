@@ -57,7 +57,9 @@ def validate_on_data(model: Model, data: Dataset,
                      save_utility_per_sentence: bool = False,
                      utility_type=None,
                      rank=0,
-                     world_size=1) \
+                     world_size=1,
+                     utility_regularising_loss=False,
+                     precompute_batch=False) \
         -> (float, float, float, List[str], List[List[str]], List[str],
             List[str], List[List[str]], List[np.array]):
     """
@@ -134,6 +136,9 @@ def validate_on_data(model: Model, data: Dataset,
     pad_index = model.src_vocab.stoi[PAD_TOKEN]
     # disable dropout
     model.eval()
+    # initialise utility function just once
+    if mbr:
+        utility_fn = get_utility_fn(utility_type)
     # don't track gradients during validation
     with torch.no_grad():
         all_outputs = []
@@ -141,6 +146,7 @@ def validate_on_data(model: Model, data: Dataset,
         total_loss = 0
         total_ntokens = 0
         total_nseqs = 0
+        encoder_hidden, encoder_output = None, None
         # gather subset of data
         for valid_batch in valid_dataloader:
             # run as during training to get validation loss (e.g. xent)
@@ -151,7 +157,12 @@ def validate_on_data(model: Model, data: Dataset,
 
             # run as during training with teacher forcing
             if compute_loss and batch.trg is not None:
-                batch_loss, _, _, _ = model(return_type="loss", **{"batch": batch, **vars(batch)})
+                batch_loss, _, encoder_output, encoder_hidden = model(return_type="loss", **{"batch": batch,
+                                                                                             "utility_regularising": utility_regularising_loss,
+                                                                                             'utility_type': utility_type,
+                                                                                             **vars(batch),
+                                                                                             "return_encoded": mbr and precompute_batch})
+
                 if n_gpu > 1 and not model.ddp:
                     batch_loss = batch_loss.mean()  # average on multi-gpu
                 total_loss += batch_loss
@@ -164,9 +175,12 @@ def validate_on_data(model: Model, data: Dataset,
                     model=model, batch=batch, beam_size=beam_size,
                     beam_alpha=beam_alpha, max_output_length=max_output_length, sample=sample)
             else:
+                logger.info(f"Validation batch {i}/{len(valid_dataloader)}, rank {rank}")
                 output = mbr_decoding(model=model, batch=batch, max_output_length=max_output_length,
                                       compute_log_probs=False, need_grad=False, return_types=["h"],
-                                      num_samples=num_samples, mbr_type=mbr_type, utility_type=utility_type)[0]
+                                      num_samples=num_samples, mbr_type=mbr_type, utility_type=utility_type,
+                                      utility_fn=utility_fn, encoded_batch=[encoder_output, encoder_hidden],
+                                      small_test_run=small_test_run)[0]
                 attention_scores = None
 
             # sort outputs back to original order
@@ -636,8 +650,8 @@ def get_utility_of_samples(utility_type, sample_1, sample_2, reduce_type="mean",
 
 
 def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="editdistance",
-                 utility_type="editdistance", return_types=("h",),
-                 need_grad=False, compute_log_probs=False, encoded_batch=None):
+                 utility_type="editdistance", utility_fn=None, return_types=("h",),
+                 need_grad=False, compute_log_probs=False, encoded_batch=None, small_test_run = False):
     set_of_possible_returns = {"h", "samples", "utilities", "log_probabilities"}
     assert len(set(return_types) - set_of_possible_returns) == 0, f"You have specified wrong return types. " \
                                                                   f"Make sure it's one (or more) out of {set_of_possible_returns}"
@@ -648,7 +662,17 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
     batch.src = batch.src.repeat(num_samples, 1)
     batch.src_mask = batch.src_mask.repeat(num_samples, 1, 1)
     batch.trg_mask = batch.trg_mask.repeat(num_samples, 1, 1)
-    # logger.info(f" batch device in mbr {batch.src.device}")
+    if encoded_batch[0] is not None:
+        try:
+            encoded_batch[0] = encoded_batch[0].repeat(num_samples, 1, 1)
+        except:
+            pass
+        try:
+            encoded_batch[1] = encoded_batch[1].repeat(num_samples, 1, 1)
+        except:
+            pass
+    else:
+        encoded_batch = None
     # [B*SxL, B*S]
     samples, log_probs = run_batch(model, batch, max_output_length=max_output_length, beam_size=1, beam_alpha=1,
                                    sample=True, need_grad=need_grad, compute_log_probs=compute_log_probs,
@@ -663,7 +687,9 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
     if mbr_type == "editdistance":
         # define utility function
         # todo check if the java problem is due to this
-        utility_fn = get_utility_fn(utility_type)
+        if utility_fn is None:
+            logger.info(f"Loading utility {utility_type}")
+            utility_fn = get_utility_fn(utility_type)
         # transform indices to str [BxS]
         decoded_samples = [
             [' '.join(sample) for sample in model.trg_vocab.arrays_to_sentences(arrays=batch,

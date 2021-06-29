@@ -196,6 +196,7 @@ class TrainManager:
                 .get("tokenize", "13a")
 
         self.sample = test_config.get("sample", False)
+        self.precompute_validation = train_config.get("validation_precompute_batch", False)
         # learning rate scheduling
         self.scheduler, self.scheduler_step_at = build_scheduler(
             config=train_config,
@@ -247,6 +248,9 @@ class TrainManager:
         self.world_size = self.num_nodes * self.n_gpu
         self.distributed_batch_sampler = train_config.get("distributed_batch_sampler", False)
         self.child_conn = None  # set by child process in case of ddp
+        # initialise the utility function
+        if not self.ddp and self.utility_regularising:
+            self.model.loss_function._utility_fn = get_utility_fn(self.utility_type)
         # if self.use_cuda:
         #     torch.cuda.empty_cache()
         if self.use_cuda and not self.ddp:
@@ -485,6 +489,9 @@ class TrainManager:
                 reset_optimizer=self.train_config.get("reset_optimizer", False),
                 reset_iter_state=self.train_config.get("reset_iter_state", False))
         self.model = _DistributedDataParallel(self.model, device_ids=[gpu])
+        # init utility_fn
+        if self.utility_regularising:
+            self.model.loss_function._utility_fn = get_utility_fn(self.utility_type)
 
         if self.distributed_batch_sampler:
             self.batch_sampler = DistributedBatchSamplerSimilarLength(train_data, self.batch_size)
@@ -866,7 +873,8 @@ class TrainManager:
                 utility_type=self.utility_type,
                 rank=self.rank,
                 world_size=self.world_size,
-                save_utility_per_sentence=self.save_utility_per_sentence
+                save_utility_per_sentence=self.save_utility_per_sentence,
+                utility_regularising_loss=self.utility_regularising,
             )
 
         # synchronise+reduce valid scores between the processess
