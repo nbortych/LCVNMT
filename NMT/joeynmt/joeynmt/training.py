@@ -238,8 +238,8 @@ class TrainManager:
         self.device = torch.device("cuda" if self.use_cuda else "cpu")
         self.model.device = self.device
         # DDP
-        # if there is no cuda available, do not use DDP
-        self.ddp = train_config.get("ddp", False) if self.use_cuda else False
+        # if there is no cuda available and less than 2 gpus, do not use DDP
+        self.ddp = train_config.get("ddp", False) if self.use_cuda and self.n_gpu > 1 else False
         self.model.ddp = self.ddp
         self.rank = None
         self.num_nodes = train_config.get("num_nodes", 1)
