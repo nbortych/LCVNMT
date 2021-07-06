@@ -139,6 +139,8 @@ def validate_on_data(model: Model, data: Dataset,
     # initialise utility function just once
     if mbr and utility_type == "beer":
         utility_fn = [get_utility_fn(utility_type) for _ in range(mp.cpu_count())]
+    else:
+        utility_fn = None
     # don't track gradients during validation
     with torch.no_grad():
         all_outputs = []
@@ -255,6 +257,12 @@ def validate_on_data(model: Model, data: Dataset,
             current_valid_score = -1
             reduced_utility = 0
             utility_per_sentence = None
+
+    if type(utility_fn) == list and utility_type == "beer":
+        for utility in utility_fn:
+            utility.proc.terminate()
+    elif utility_type == "beer":
+        utility_fn.proc.terminate()
 
     return current_valid_score, valid_loss, valid_ppl, valid_sources, \
            valid_sources_raw, valid_references, valid_hypotheses, \
