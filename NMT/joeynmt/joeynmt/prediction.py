@@ -137,8 +137,8 @@ def validate_on_data(model: Model, data: Dataset,
     # disable dropout
     model.eval()
     # initialise utility function just once
-    if mbr:
-        utility_fn = get_utility_fn(utility_type)
+    if mbr and utility_type == "beer":
+        utility_fn = [get_utility_fn(utility_type) for _ in range(mp.cpu_count())]
     # don't track gradients during validation
     with torch.no_grad():
         all_outputs = []
@@ -251,7 +251,6 @@ def validate_on_data(model: Model, data: Dataset,
                 reduced_utility, utility_per_sentence = get_utility_of_samples(utility_type, valid_hypotheses,
                                                                                valid_references, reduce_type="mean",
                                                                                save_utility_per_sentence=save_utility_per_sentence)
-            # todo save utility per sentence
         else:
             current_valid_score = -1
             reduced_utility = 0
@@ -637,7 +636,7 @@ def get_utility_of_samples(utility_type, sample_1, sample_2, reduce_type="mean",
 
 def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="editdistance",
                  utility_type="editdistance", utility_fn=None, return_types=("h",),
-                 need_grad=False, compute_log_probs=False, encoded_batch=None, small_test_run = False):
+                 need_grad=False, compute_log_probs=False, encoded_batch=None, small_test_run=False):
     set_of_possible_returns = {"h", "samples", "utilities", "log_probabilities"}
     assert len(set(return_types) - set_of_possible_returns) == 0, f"You have specified wrong return types. " \
                                                                   f"Make sure it's one (or more) out of {set_of_possible_returns}"
@@ -699,32 +698,28 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
             U[:, triu_indices[0], triu_indices[1]] = utilities
         else:
             # permutations of all samples [Bx(S^2)]
-            batch_combinations_of_samples = [itertools.product(batch_samples, repeat=2) for batch_samples in
+            batch_combinations_of_samples = [list(itertools.product(batch_samples, repeat=2)) for batch_samples in
                                              decoded_samples]
 
             # # computing utility of the samples [Bx(S^2)]
             # [B*S^2]
-            def batch_call(batch_combinations_of_samples):
-                hyp_ref_batches = [zip(*batch) for batch in batch_combinations_of_samples]
-                hyp_batch, ref_batch = (), ()
-                for h, r in hyp_ref_batches:
-                    hyp_batch += h
-                    ref_batch += r
-                # logger.info(f"len {len(hyp_batch)}, {len(ref_batch)}, batch size {batch_size}, num samples{num_samples}")
-                utilities = torch.tensor([utility_fn.call_batch(hyp_batch, ref_batch)], dtype=torch.float)
+            if type(utility_fn) != list:
+                utilities = torch.tensor([list(itertools.starmap(utility_fn, combinations_of_samples)) for
+                                          combinations_of_samples in batch_combinations_of_samples], dtype=torch.float)
+            elif type(utility_fn) == list:
+                cpus = mp.cpu_count()
+                num_per_thread = int(np.ceil(len(batch_combinations_of_samples) / cpus))
+                chunked_batch_combinations_of_samples = [batch_combinations_of_samples[i:i + num_per_thread] for i in
+                                                         range(0, len(batch_combinations_of_samples), num_per_thread)]
+                utility_fns_and_batches = [(chunk, utility_fn[i]) for i, chunk in
+                                           enumerate(chunked_batch_combinations_of_samples)]
+                with ThreadPool(cpus) as p:
+                    utilities = p.map(eval_utility_batches_threads, utility_fns_and_batches)
+                utilities = [u for sublist in utilities for u in sublist]
+                utilities = torch.tensor(utilities, dtype=torch.float)
 
             # setting the values to the matrix [BxSxS]
-            # logger.info(" Using batch call")
-            if not small_test_run:
-                utilities = torch.tensor([list(itertools.starmap(utility_fn, combinations_of_samples)) for
-                                      combinations_of_samples in batch_combinations_of_samples], dtype=torch.float)
-            else:
-                with ThreadPool(4) as p:
-                    utilities = torch.tensor([list(p.starmap(utility_fn, combinations_of_samples)) for
-                                  combinations_of_samples in batch_combinations_of_samples], dtype=torch.float)
-
             U = utilities.reshape(batch_size, num_samples, num_samples)
-            # logger.info(f"U {U.shape}")
         # compute utility per candidate [BxS]
         expected_uility = torch.mean(U, dim=-1)
         # get argmin_c of sum^S u(samples, c) (min because we want less edit distance) [B]
@@ -777,6 +772,56 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
         # string_samples = list(map(lambda sample: list(map(lambda batch: ''.join(list(map(str,batch))) , sample.tolist()) ),big_l))
         prediction_idx, prediction = mbr.mbr(string_samples, utility_fn)
         return prediction
+
+
+# def eval_utility(*args):
+#     # print(os.listdir())
+#     utility_fn = get_utility_fn("beer")
+#     utility =  utility_fn(*args)
+#     utility_fn.proc.kill()
+#     return utility
+# calling the call_batch function
+# def batch_call_utility_fn(batch_combinations_of_samples, utility_fn):
+#     hyp_ref_batches = [zip(*batch) for batch in batch_combinations_of_samples]
+#     hyp_batch, ref_batch = (), ()
+#     for h, r in hyp_ref_batches:
+#         hyp_batch += h
+#         ref_batch += r
+#     # logger.info(f"len {len(hyp_batch)}, {len(ref_batch)}, batch size {batch_size}, num samples{num_samples}")
+#     utilities = torch.tensor([utility_fn.call_batch(hyp_batch, ref_batch)], dtype=torch.float)
+
+# eval utility of a single batch
+# def eval_utility_batch(batch):
+#     utility_fn = get_utility_fn("beer")
+#     utility = [utility_fn(*combination_of_samples) for combination_of_samples in batch]
+#     return utility
+
+
+def eval_utility_batches_threads(batches_and_fn):
+    utility_fn = batches_and_fn[1]
+    batches = batches_and_fn[0]
+    utility = [list(itertools.starmap(utility_fn, combinations_of_samples)) for
+               combinations_of_samples in batches]
+    return utility
+
+# eval utility of multiple batches
+#     with mp.Pool(cpus) as p:
+#         utilities = p.map(eval_utility_batches, chunked_batch_combinations_of_samples)
+
+# def eval_utility_batches(batches):
+#     utility_fn = get_utility_fn("beer")
+#     utility = [list(itertools.starmap(utility_fn, combinations_of_samples)) for
+#                combinations_of_samples in batches]
+#     # utility = [utility_fn(*combination_of_samples) for combination_of_samples in batch]
+#     return utility
+
+#
+# class Beer_multiprocess():
+#     def __init__(self, num_threads):
+#         self.processes = [get_utility_fn("beer") for _ in range(num_threads)]
+#
+#     def call_batches(self, *args, **kwargs):
+#         pass
 
 
 if __name__ == "__main__":
