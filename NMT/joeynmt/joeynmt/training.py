@@ -416,7 +416,7 @@ class TrainManager:
 
         # restore model and optimizer parameters
         self.model.load_state_dict(model_checkpoint["model_state"])
-        model.ddp = model_checkpoint.get('ddp', False)
+        self.model.ddp = model_checkpoint.get('ddp', False)
         if not reset_optimizer:
             self.optimizer.load_state_dict(model_checkpoint["optimizer_state"])
         else:
