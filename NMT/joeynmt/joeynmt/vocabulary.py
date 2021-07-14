@@ -8,6 +8,7 @@ from typing import List
 import numpy as np
 import torchtext
 from torchtext.legacy.data import Dataset
+import pickle
 
 from joeynmt.constants import UNK_TOKEN, DEFAULT_UNK_ID, \
     EOS_TOKEN, BOS_TOKEN, PAD_TOKEN
@@ -16,7 +17,7 @@ from joeynmt.constants import UNK_TOKEN, DEFAULT_UNK_ID, \
 class Vocabulary:
     """ Vocabulary represents mapping between tokens and indices. """
 
-    def __init__(self, tokens: List[str] = None, file: str = None) -> None:
+    def __init__(self, tokens: List[str] = None, file: str = None, pickle_file: str = None) -> None:
         """
         Create vocabulary from list of tokens or file.
 
@@ -38,6 +39,8 @@ class Vocabulary:
             self._from_list(tokens)
         elif file is not None:
             self._from_file(file)
+        elif pickle_file is not None:
+            self._from_pickle(pickle_file)
 
     def _from_list(self, tokens: List[str] = None) -> None:
         """
@@ -49,6 +52,20 @@ class Vocabulary:
         """
         self.add_tokens(tokens=self.specials + tokens)
         assert len(self.stoi) == len(self.itos)
+
+    def _from_pickle(self, pickle_file: str) -> None:
+        """
+        Make vocabulary from contents of a pickle file.
+        File format: .pickle
+
+        :param file: path to file where the vocabulary is loaded from
+        """
+
+        with open(pickle_file, 'rb') as dictionary_pickle_file:
+            dictionary_pickle = pickle.load(dictionary_pickle_file)
+        self.itos = dictionary_pickle['itos']
+        self.stoi = dictionary_pickle['stoi']
+
 
     def _from_file(self, file: str) -> None:
         """
@@ -75,6 +92,11 @@ class Vocabulary:
         with open(file, "w") as open_file:
             for t in self.itos:
                 open_file.write("{}\n".format(t))
+
+    def to_pickle(self, pickle_file):
+        vocab_dict = {'stoi': self.stoi.copy(), 'itos': self.itos.copy()}
+        with open(pickle_file, 'wb') as vocab_file:
+            pickle.dump(vocab_dict, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
     def add_tokens(self, tokens: List[str]) -> None:
         """
