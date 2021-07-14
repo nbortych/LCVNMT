@@ -770,7 +770,7 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
             return_list.append(log_probs)
         if "mean_batch_expected_uility_h" in return_types:
             logger.info(f"best_idx {best_idx} expected_utility shape {expected_uility.shape}")
-            return_list.append(torch.mean(expected_uility[best_idx].detach()))
+            return_list.append(torch.mean(expected_uility[:,best_idx].detach()))
         return return_list
 
 
