@@ -11,7 +11,9 @@ data:
   max_sent_length: 62
   src_vocab: "test/data/iwslt14/vocab.txt"
   trg_vocab: "test/data/iwslt14/vocab.txt"
-
+  use_pickled_vocab: True
+  src_vocab_pickle: "test/data/iwslt14/vocab.pickle"
+  trg_vocab_pickle: "test/data/iwslt14/vocab.pickle"
 testing:
   beam_size: 1
   alpha: 1.0
@@ -20,7 +22,7 @@ testing:
   mbr: True
   mbr_type: "editdistance"
   utility: "beer"
-  num_samples: 3
+  num_samples: 10
   save_utility_per_sentence: True
 training:
 #  load_model: "models/iwslt14-deen-bpe-transformer_test/3.ckpt"
@@ -37,10 +39,10 @@ training:
   weight_decay: 0.0
   label_smoothing: 0
   batch_size: 128
-  batch_type: "token"
+  batch_type: "sentence"
   early_stopping_metric: "utility"
   epochs: 2
-  validation_freq: 1000
+  validation_freq: 10
   logging_freq: 100
   eval_metric: ""
   model_dir: "models/iwslt14-deen-bpe-transformer_test"#_checkpoint"
@@ -55,8 +57,8 @@ training:
   track_mbr: True
   mbr_type: "editdistance"
   utility: "beer"
-  small_test_run: False
-  utility_regularising: False
+  small_test_run: True
+  utility_regularising: True
   utility_alpha: 1
   num_samples: 2
   ddp: True
@@ -64,10 +66,11 @@ training:
   distributed_batch_sampler: True
   mean_baseline: True
   vimco_baseline: True
-  wandb: True
+  wandb: False
   early_stopping: True
   validation_stopping: False
   early_stopping_patience: 10
+  validation_precompute_batch: False
 
 
 model:

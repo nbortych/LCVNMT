@@ -35,12 +35,14 @@ class Vocabulary:
 
         self.stoi = defaultdict(DEFAULT_UNK_ID)
         self.itos = []
+
         if tokens is not None:
             self._from_list(tokens)
-        elif file is not None:
-            self._from_file(file)
         elif pickle_file is not None:
             self._from_pickle(pickle_file)
+        elif file is not None:
+            self._from_file(file)
+
 
     def _from_list(self, tokens: List[str] = None) -> None:
         """
@@ -96,7 +98,7 @@ class Vocabulary:
     def to_pickle(self, pickle_file):
         vocab_dict = {'stoi': self.stoi.copy(), 'itos': self.itos.copy()}
         with open(pickle_file, 'wb') as vocab_file:
-            pickle.dump(vocab_dict, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(vocab_dict, vocab_file, protocol=pickle.HIGHEST_PROTOCOL)
 
     def add_tokens(self, tokens: List[str]) -> None:
         """
@@ -164,7 +166,7 @@ class Vocabulary:
 
 
 def build_vocab(language: str, max_size: int, min_freq: int, dataset: Dataset,
-                vocab_file: str = None) -> Vocabulary:
+                vocab_file: str = None, pickle_file = None) -> Vocabulary:
     """
     Builds vocabulary for a given`dataset` or `vocab_file`.
 
@@ -176,9 +178,9 @@ def build_vocab(language: str, max_size: int, min_freq: int, dataset: Dataset,
     :return: Vocabulary created from either `dataset` or `vocab_file`
     """
 
-    if vocab_file is not None:
+    if vocab_file is not None or pickle_file is not None:
         # load it from file
-        vocab = Vocabulary(file=vocab_file)
+        vocab = Vocabulary(file=vocab_file, pickle_file = pickle_file)
     else:
         # create newly
         def filter_min(counter: Counter, min_freq: int):

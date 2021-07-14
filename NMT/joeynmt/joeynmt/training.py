@@ -1193,12 +1193,19 @@ def train(cfg_file: str) -> None:
                       trg_vocab=trg_vocab)
 
     logger.info(str(model))
-
     # store the vocabs
-    src_vocab_file = "{}/src_vocab.txt".format(cfg["training"]["model_dir"])
-    src_vocab.to_file(src_vocab_file)
-    trg_vocab_file = "{}/trg_vocab.txt".format(cfg["training"]["model_dir"])
-    trg_vocab.to_file(trg_vocab_file)
+    use_pickled_vocab = cfg['data'].get('use_pickled_vocab', False)
+    vocab_extension = "pickle" if use_pickled_vocab else "txt"
+    src_vocab_file = f'{cfg["training"]["model_dir"]}/src_vocab.{vocab_extension}'
+    trg_vocab_file = f'{cfg["training"]["model_dir"]}/trg_vocab.{vocab_extension}'
+    # pickle or save to txt
+    if use_pickled_vocab:
+        src_vocab.to_pickle(src_vocab_file)
+        trg_vocab.to_pickle(trg_vocab_file)
+    else:
+        src_vocab.to_file(src_vocab_file)
+        trg_vocab.to_file(trg_vocab_file)
+
     # train the model
     if trainer.ddp:
         parent_conn, child_conn = mp.Pipe()

@@ -91,16 +91,21 @@ def load_data(data_cfg: dict, datasets: list = None) \
     src_vocab_file = data_cfg.get("src_vocab", None)
     trg_vocab_file = data_cfg.get("trg_vocab", None)
 
-    assert (train_data is not None) or (src_vocab_file is not None)
-    assert (train_data is not None) or (trg_vocab_file is not None)
+    src_vocab_pickle = data_cfg.get("src_vocab_pickle", None)
+    trg_vocab_pickle = data_cfg.get("trg_vocab_pickle", None)
+
+    assert (train_data is not None) or (src_vocab_file is not None) or (src_vocab_pickle is not None)
+    assert (train_data is not None) or (trg_vocab_file is not None) or (trg_vocab_pickle is not None)
     # todo maybe build vocab before train_data...
     logger.info("Building vocabulary...")
     src_vocab = build_vocab(language="src", min_freq=src_min_freq,
                             max_size=src_max_size,
-                            dataset=train_data, vocab_file=src_vocab_file)
+                            dataset=train_data, vocab_file=src_vocab_file,
+                            pickle_file=src_vocab_pickle)
     trg_vocab = build_vocab(language="trg", min_freq=trg_min_freq,
                             max_size=trg_max_size,
-                            dataset=train_data, vocab_file=trg_vocab_file)
+                            dataset=train_data, vocab_file=trg_vocab_file,
+                            pickle_file=trg_vocab_pickle)
     train_data.src_vocab = src_vocab
     train_data.trg_vocab = trg_vocab
 
@@ -149,14 +154,15 @@ def make_dataloader(dataset: Dataset,
     :return: torch dataloader
     """
 
-
     # transform words into indices
     def vocab_transform(x, vocab):
         return torch.tensor(
             [vocab.stoi[BOS_TOKEN]] + [vocab.stoi[token] for token in x] + [vocab.stoi[EOS_TOKEN]])
+
     # extract vocab
     src_vocab = dataset.src_vocab
     trg_vocab = dataset.trg_vocab
+
     # collate batch
     def generate_batch(data_batch):
         src_batch, trg_batch = [], []
@@ -174,7 +180,6 @@ def make_dataloader(dataset: Dataset,
             src_len_batch), \
                pad_sequence(trg_batch, batch_first=True, padding_value=trg_vocab.stoi[PAD_TOKEN]), torch.tensor(
             trg_len_batch)
-
 
     kwargs = {"batch_size": batch_size,
               "shuffle": shuffle, "collate_fn": generate_batch,
@@ -241,6 +246,7 @@ class DistributedBatchSamplerSimilarLength(DistributedSampler):
         self.indices = torch.tensor([(i, src_len) for i, (src, src_len, trg, trg_len) in enumerate(dataset)])
 
         logger.info(f"indices length total {len(self.indices)}")
+
     def __iter__(self):
         # get indices that will be processed by this rank
         indices_on_this_rank = list(super().__iter__())
@@ -407,7 +413,7 @@ class DistributedEvalSampler(Sampler):
         self.num_replicas = num_replicas
         self.rank = rank
         self.epoch = 0
-        self.total_size = len(self.dataset)         # true value without extra samples
+        self.total_size = len(self.dataset)  # true value without extra samples
         indices = list(range(self.total_size))
         self.indices = indices[self.rank:self.total_size:self.num_replicas]
         self.num_samples = len(self.indices)
