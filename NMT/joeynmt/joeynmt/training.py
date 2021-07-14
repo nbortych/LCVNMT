@@ -308,7 +308,7 @@ class TrainManager:
         with open('wandb_api_key.txt', 'r') as f:
             api_key = f.readline()
         wandb.login(key=api_key)
-        wandb.init(project="lcv-nmt", config=config)
+        wandb.init(project="lcv-nmt", config=config, id = "baseline0", resume=True)
 
     def _save_checkpoint(self, new_best: bool = True) -> None:
         """
