@@ -661,7 +661,7 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
     batch.src = batch.src.repeat(num_samples, 1)
     batch.src_mask = batch.src_mask.repeat(num_samples, 1, 1)
     batch.trg_mask = batch.trg_mask.repeat(num_samples, 1, 1)
-    if encoded_batch[0] is not None:
+    if encoded_batch is not None and encoded_batch[0] is not None:
         try:
             encoded_batch[0] = encoded_batch[0].repeat(num_samples, 1, 1)
         except:
@@ -676,6 +676,8 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
     samples, log_probs = run_batch(model, batch, max_output_length=max_output_length, beam_size=1, beam_alpha=1,
                                    sample=True, need_grad=need_grad, compute_log_probs=compute_log_probs,
                                    encoded_batch=encoded_batch)
+    # if rank is not None:
+    # logger.info(f"got samples rank {rank}")
 
     # [BxSxL] transpose is needed to make sure that it's actually split by batches
     samples = samples.reshape(num_samples, batch_size, -1).transpose((1, 0, 2))
@@ -687,7 +689,7 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
         # define utility function
         # todo check if the java problem is due to this
         if utility_fn is None:
-            logger.info(f"Loading utility {utility_type}")
+            # logger.info(f"Loading utility {utility_type}")
             utility_fn = get_utility_fn(utility_type)
         # transform indices to str [BxS]
         decoded_samples = [
@@ -744,8 +746,11 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
         #     logger.info(f"computed utility rank {rank}")
         # compute utility per candidate [BxS]
         expected_uility = torch.mean(U, dim=-1)
-        # get argmin_c of sum^S u(samples, c) (min because we want less edit distance) [B]
-        best_idx = torch.argmin(expected_uility, dim=-1)
+        # get argmin_c or argmax_c of sum^S u(samples, c) (min because we want less edit distance) [B]
+        if utility_type == "editdistance":
+            best_idx = torch.argmin(expected_uility, dim=-1)
+        else:
+            best_idx = torch.argmax(expected_uility, dim=-1)
         # return things that you want to return
         return_list = []
         if "h" in return_types:
@@ -828,6 +833,7 @@ def eval_utility_batches_threads(batches_and_fn):
     utility = [list(itertools.starmap(utility_fn, combinations_of_samples)) for
                combinations_of_samples in batches]
     return utility
+
 
 # eval utility of multiple batches
 #     with mp.Pool(cpus) as p:
