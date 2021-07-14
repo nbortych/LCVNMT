@@ -410,7 +410,7 @@ class DistributedEvalSampler(Sampler):
         self.total_size = len(self.dataset)         # true value without extra samples
         indices = list(range(self.total_size))
         self.indices = indices[self.rank:self.total_size:self.num_replicas]
-        self.num_samples = len(indices)             # true value without extra samples
+        self.num_samples = len(self.indices)
         logger.info(f"indices length validation  {len(self.indices)} total size {self.total_size}")
 
     def __iter__(self):
