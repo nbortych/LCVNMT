@@ -149,6 +149,7 @@ def validate_on_data(model: Model, data: Dataset,
         total_ntokens = 0
         total_nseqs = 0
         encoder_hidden, encoder_output = None, None
+        expected_utility_total = 0
         # gather subset of data
         for i, valid_batch in enumerate(valid_dataloader):
             # run as during training to get validation loss (e.g. xent)
@@ -177,14 +178,17 @@ def validate_on_data(model: Model, data: Dataset,
                     model=model, batch=batch, beam_size=beam_size,
                     beam_alpha=beam_alpha, max_output_length=max_output_length, sample=sample)
             else:
-                logger.info(f"Validation batch {i}/{len(valid_dataloader)}, rank {rank}")
-                output = mbr_decoding(model=model, batch=batch, max_output_length=max_output_length,
-                                      compute_log_probs=False, need_grad=False, return_types=["h"],
-                                      num_samples=num_samples, mbr_type=mbr_type, utility_type=utility_type,
-                                      utility_fn=utility_fn, encoded_batch=[encoder_output, encoder_hidden],
-                                      small_test_run=small_test_run)[0]
+                # logger.info(f"Validation batch {i}/{len(valid_dataloader)}, rank {rank}")
+                output, expected_utility = mbr_decoding(model=model, batch=batch, max_output_length=max_output_length,
+                                                        compute_log_probs=False, need_grad=False,
+                                                        return_types=["h", "mean_batch_expected_uility_h"],
+                                                        num_samples=num_samples, mbr_type=mbr_type,
+                                                        utility_type=utility_type,
+                                                        utility_fn=utility_fn,
+                                                        encoded_batch=[encoder_output, encoder_hidden],
+                                                        small_test_run=small_test_run, rank=rank, world_size=world_size)
                 attention_scores = None
-
+                expected_utility_total += expected_utility
             # sort outputs back to original order
             all_outputs.extend(output[sort_reverse_index])
 
@@ -196,7 +200,7 @@ def validate_on_data(model: Model, data: Dataset,
         if model.ddp:
             data = Subset(data, indices=ddp_indices)
         assert len(all_outputs) == len(data)
-
+        expected_utility_mean = expected_utility_total/len(valid_dataloader)
         if compute_loss and total_ntokens > 0:
             # exponent of token-level negative log prob
             valid_ppl = torch.exp(total_loss / total_ntokens).item()
@@ -257,18 +261,16 @@ def validate_on_data(model: Model, data: Dataset,
             current_valid_score = -1
             reduced_utility = 0
             utility_per_sentence = None
-
-    print(utility_fn, "utility_fn")
+    # terminate open processes
     if type(utility_fn) == list and utility_type == "beer":
         for utility in utility_fn:
             utility.proc.terminate()
     elif utility_type == "beer" and utility_fn is not None:
         utility_fn.proc.terminate()
 
-
     return current_valid_score, valid_loss, valid_ppl, valid_sources, \
            valid_sources_raw, valid_references, valid_hypotheses, \
-           decoded_valid, valid_attention_scores, reduced_utility, utility_per_sentence
+           decoded_valid, valid_attention_scores, reduced_utility, utility_per_sentence, expected_utility_mean
 
 
 def parse_test_args(cfg, mode="test"):
@@ -432,7 +434,7 @@ def test(cfg_file,
 
         # pylint: disable=unused-variable
         score, loss, ppl, sources, sources_raw, references, hypotheses, \
-        hypotheses_raw, attention_scores, utility, utility_per_sentence = validate_on_data(
+        hypotheses_raw, attention_scores, utility, utility_per_sentence, expected_utility_mean = validate_on_data(
             model, data=data_set, batch_size=batch_size,
             batch_class=batch_class, batch_type=batch_type, level=level,
             max_output_length=max_output_length, eval_metric=eval_metric,
@@ -519,7 +521,7 @@ def translate(cfg_file: str,
         """ Translates given dataset, using parameters from outer scope. """
         # pylint: disable=unused-variable
         score, loss, ppl, sources, sources_raw, references, hypotheses, \
-        hypotheses_raw, attention_scores, utility, utility_per_sentence = validate_on_data(
+        hypotheses_raw, attention_scores, utility, utility_per_sentence, expected_utility_mean = validate_on_data(
             model, data=test_data, batch_size=batch_size,
             batch_class=batch_class, batch_type=batch_type, level=level,
             max_output_length=max_output_length, eval_metric="",
@@ -646,8 +648,9 @@ def get_utility_of_samples(utility_type, sample_1, sample_2, reduce_type="mean",
 
 def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="editdistance",
                  utility_type="editdistance", utility_fn=None, return_types=("h",),
-                 need_grad=False, compute_log_probs=False, encoded_batch=None, small_test_run=False):
-    set_of_possible_returns = {"h", "samples", "utilities", "log_probabilities"}
+                 need_grad=False, compute_log_probs=False, encoded_batch=None, small_test_run=False,
+                 rank=None, world_size=1):
+    set_of_possible_returns = {"h", "samples", "utilities", "log_probabilities", "mean_batch_expected_uility_h"}
     assert len(set(return_types) - set_of_possible_returns) == 0, f"You have specified wrong return types. " \
                                                                   f"Make sure it's one (or more) out of {set_of_possible_returns}"
     # sample S samples of translation y|x  using  run_batch
@@ -746,11 +749,14 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
             best_idx = best_idx.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, num_samples)
             # [BxS]
             u_h = U.gather(1, best_idx).squeeze(1)
-            print("u_h", u_h)
+            # print("u_h", u_h)
             # u_h = u_h + 1e-10
             return_list.append(u_h)
         if "log_probabilities" in return_types:
             return_list.append(log_probs)
+        if "mean_batch_expected_uility_h" in return_types:
+            logger.info(f"best_idx {best_idx} expected_utility shape {expected_uility.shape}")
+            return_list.append(torch.mean(expected_uility[best_idx].detach()))
         return return_list
 
 

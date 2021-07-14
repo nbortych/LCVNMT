@@ -859,7 +859,7 @@ class TrainManager:
         valid_start_time = time.time()
         valid_score, valid_loss, valid_ppl, valid_sources, \
         valid_sources_raw, valid_references, valid_hypotheses, \
-        valid_hypotheses_raw, valid_attention_scores, valid_utility, utility_per_sentence = \
+        valid_hypotheses_raw, valid_attention_scores, valid_utility, utility_per_sentence, expected_utility_mean = \
             validate_on_data(
                 batch_size=self.eval_batch_size if not track_mbr else self.eval_batch_size // self.test_num_samples,
                 batch_class=self.batch_class,
@@ -896,12 +896,14 @@ class TrainManager:
                 valid_score = self._synch_reduce_ddp(valid_score, reduce_type="mean")
             valid_ppl = self._synch_reduce_ddp(valid_ppl, reduce_type="mean")
             valid_utility = self._synch_reduce_ddp(valid_utility, reduce_type="mean")
+            if track_mbr:
+                expected_utility_mean = self._synch_reduce_ddp(expected_utility_mean, reduce_type="mean")
             if self.save_utility_per_sentence:
                 utility_per_sentence = self._synch_reduce_ddp(utility_per_sentence, reduce_type=None)
 
         if not self.ddp or self.rank == 0:
-            for name, score in zip(["valid_loss", "valid_score", "valid_ppl", "valid_utility"],
-                                   [valid_loss, valid_score, valid_ppl, valid_utility]):
+            for name, score in zip(["valid_loss", "valid_score", "valid_ppl", "valid_utility", "expected_utility_mean"],
+                                   [valid_loss, valid_score, valid_ppl, valid_utility, expected_utility_mean]):
                 # don't log, if not computed
                 if self.eval_metric == '' and name == 'valid_score':
                     continue
