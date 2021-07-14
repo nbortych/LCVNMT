@@ -1084,7 +1084,7 @@ class TrainManager:
 
         current_valid_output_file = "{}/{}_{}.hyps".format(self.model_dir,
                                                            self.stats.steps,
-                                                           mbr)
+                                                           "mbr" if mbr else "greedy")
 
         with open(current_valid_output_file, 'w') as opened_file:
             for hyp in hypotheses:
