@@ -98,7 +98,8 @@ class Model(nn.Module):
                                                                        batch=kwargs['batch'],
                                                                        batch_loss=batch_loss,
                                                                        utility_type=kwargs['utility_type'],
-                                                                       encoded_batch = (encoder_output, encoder_hidden))
+                                                                       encoded_batch = None)
+                                                                       # (encoder_output, encoder_hidden))
 
             else:
                 log_dict = {"nll": batch_loss.item(), "utility_term": None, "u_h": None}
