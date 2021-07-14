@@ -43,7 +43,7 @@ class XentLoss(nn.Module):
         # initialise utility fn once
         self._utility_fn = None
 
-    def utility_loss(self, model, batch, batch_loss, utility_type='editdistance'):
+    def utility_loss(self, model, batch, batch_loss, utility_type='beer', encoded_batch = None ):
         log_dict = {"nll": batch_loss.item()}
         # reinforce: \delta E = E_{p(y|\theta, x)} [log u(y,h) * \delta log p (y|\theta, x)]
         from joeynmt.prediction import mbr_decoding
@@ -54,7 +54,7 @@ class XentLoss(nn.Module):
                                              mbr_type="editdistance", utility_type=utility_type,
                                              return_types=("utilities", "log_probabilities"),
                                              need_grad=True, compute_log_probs=True,
-                                             encoded_batch=None, utility_fn=self._utility_fn)
+                                             encoded_batch=encoded_batch, utility_fn=self._utility_fn)
 
         # log_uh = torch.log(u_h).detach()
         log_dict['u_h'] = u_h.detach().clone().mean(dim=1).numpy()
@@ -96,6 +96,11 @@ class XentLoss(nn.Module):
         # compute mean of U(y,h) * \grad p(y)
         utility_term = torch.mean(u_h.to(sample_log_probs.device) * sample_log_probs)
         log_dict['utility_term'] = utility_term.item()
+
+        # todo average the samples?
+        # utility_term = utility_term/self.num_samples
+
+
         # add to the batch loss
         batch_loss += utility_term * self.utility_alpha
         # utility_term = utility_term.item()

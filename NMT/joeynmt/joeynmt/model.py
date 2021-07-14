@@ -94,11 +94,11 @@ class Model(nn.Module):
             batch_loss = self.loss_function(log_probs, kwargs["trg"])
             utility_reg = kwargs.get("utility_regularising", False)
             if utility_reg:
-                # todo pass encode batch to save computations
                 batch_loss, log_dict = self.loss_function.utility_loss(model=self,
                                                                        batch=kwargs['batch'],
                                                                        batch_loss=batch_loss,
-                                                                       utility_type=kwargs['utility_type'])
+                                                                       utility_type=kwargs['utility_type'],
+                                                                       encoded_batch = (encoder_output, encoder_hidden))
 
             else:
                 log_dict = {"nll": batch_loss.item(), "utility_term": None, "u_h": None}
