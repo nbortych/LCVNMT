@@ -138,7 +138,8 @@ def validate_on_data(model: Model, data: Dataset,
     model.eval()
     # initialise utility function just once
     if mbr and utility_type == "beer":
-        utility_fn = [get_utility_fn(utility_type) for _ in range(mp.cpu_count())]
+        # logger.info(f"Number of cpu is {mp.cpu_count()} rank {rank}, world size {world_size}")
+        utility_fn = [get_utility_fn(utility_type) for _ in range(mp.cpu_count() // world_size)]
     else:
         utility_fn = None
     # don't track gradients during validation
@@ -720,19 +721,27 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
                 utilities = torch.tensor([list(itertools.starmap(utility_fn, combinations_of_samples)) for
                                           combinations_of_samples in batch_combinations_of_samples], dtype=torch.float)
             elif type(utility_fn) == list:
-                cpus = mp.cpu_count()
+                # number of threads is number of cpus per gpu
+                cpus = mp.cpu_count() // world_size
+                # number of examples per thread
                 num_per_thread = int(np.ceil(len(batch_combinations_of_samples) / cpus))
-                chunked_batch_combinations_of_samples = [batch_combinations_of_samples[i:i + num_per_thread] for i in
-                                                         range(0, len(batch_combinations_of_samples), num_per_thread)]
-                utility_fns_and_batches = [(chunk, utility_fn[i]) for i, chunk in
-                                           enumerate(chunked_batch_combinations_of_samples)]
+                # chunk the batch for each thread and combine with specififc utility process
+                chunked_batches =  [batch_combinations_of_samples[i:i + num_per_thread]
+                                    for i in
+                                    range(0, len(batch_combinations_of_samples), num_per_thread)]
+                logger.info(f"Batch size{ len(chunked_batches)}, utility_fn {len(utility_fn)}, num per thread {num_per_thread}")
+                chunked_utility_fns_and_batches = [(chunked_batches[i], utility_fn[i]) for i in range(len(chunked_batches))]
+
+                # multithread
                 with ThreadPool(cpus) as p:
-                    utilities = p.map(eval_utility_batches_threads, utility_fns_and_batches)
-                utilities = [u for sublist in utilities for u in sublist]
-                utilities = torch.tensor(utilities, dtype=torch.float)
+                    utilities = p.map(eval_utility_batches_threads, chunked_utility_fns_and_batches)
+                # flatten the list and wrap in a tensor
+                utilities = torch.tensor([u for sublist in utilities for u in sublist], dtype=torch.float)
 
             # setting the values to the matrix [BxSxS]
             U = utilities.reshape(batch_size, num_samples, num_samples)
+        # if rank is not None:
+        #     logger.info(f"computed utility rank {rank}")
         # compute utility per candidate [BxS]
         expected_uility = torch.mean(U, dim=-1)
         # get argmin_c of sum^S u(samples, c) (min because we want less edit distance) [B]

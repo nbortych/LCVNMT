@@ -247,12 +247,13 @@ class TrainManager:
         self.rank = None
         self.num_nodes = train_config.get("num_nodes", 1)
         self.node_nr = train_config.get("node_nr", 0)
-        self.world_size = self.num_nodes * self.n_gpu
+        self.world_size = self.num_nodes * self.n_gpu if self.n_gpu>0 else 1
         self.distributed_batch_sampler = train_config.get("distributed_batch_sampler", False)
         self.child_conn = None  # set by child process in case of ddp
         # initialise the utility function
         if not self.ddp and self.utility_regularising:
-            self.model.loss_function._utility_fn = get_utility_fn(self.utility_type)
+            self.model.loss_function._utility_fn = [get_utility_fn(self.utility_type) for _ in range(mp.cpu_count())]
+        #get_utility_fn(self.utility_type)
         # if self.use_cuda:
         #     torch.cuda.empty_cache()
         if self.use_cuda and not self.ddp:
@@ -455,7 +456,7 @@ class TrainManager:
             amp.load_state_dict(model_checkpoint['amp_state'])
 
     def make_small_data(self, data,
-                        small_data_size=30, small_epochs=2, batch_size_dividor=5):
+                        small_data_size=30, small_epochs=3, batch_size_dividor=5):
         logger.info(f"The lenght of small data is {small_data_size}")
         self.batch_size = small_data_size // batch_size_dividor
         # self.epochs = small_epochs
@@ -495,7 +496,7 @@ class TrainManager:
         self.model = _DistributedDataParallel(self.model, device_ids=[gpu])
         # init utility_fn
         if self.utility_regularising:
-            self.model.loss_function._utility_fn = get_utility_fn(self.utility_type)
+            self.model.loss_function._utility_fn = [get_utility_fn(self.utility_type) for _ in range(mp.cpu_count() // self.world_size)]
 
         # data handling
         if self.distributed_batch_sampler:
