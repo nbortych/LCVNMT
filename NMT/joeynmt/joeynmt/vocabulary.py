@@ -62,9 +62,9 @@ class Vocabulary:
 
         :param file: path to file where the vocabulary is loaded from
         """
-
         with open(pickle_file, 'rb') as dictionary_pickle_file:
             dictionary_pickle = pickle.load(dictionary_pickle_file)
+
         self.itos = dictionary_pickle['itos']
         self.stoi = dictionary_pickle['stoi']
 

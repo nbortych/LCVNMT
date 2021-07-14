@@ -42,6 +42,7 @@ class XentLoss(nn.Module):
         self._utility_step = 0
         # initialise utility fn once
         self._utility_fn = None
+        self._world_size = 1
 
     def utility_loss(self, model, batch, batch_loss, utility_type='beer', encoded_batch = None ):
         log_dict = {"nll": batch_loss.item()}
@@ -54,7 +55,8 @@ class XentLoss(nn.Module):
                                              mbr_type="editdistance", utility_type=utility_type,
                                              return_types=("utilities", "log_probabilities"),
                                              need_grad=True, compute_log_probs=True,
-                                             encoded_batch=encoded_batch, utility_fn=self._utility_fn)
+                                             encoded_batch=encoded_batch, utility_fn=self._utility_fn,
+                                             world_size=self._world_size)
 
         # log_uh = torch.log(u_h).detach()
         log_dict['u_h'] = u_h.detach().clone().mean(dim=1).numpy()

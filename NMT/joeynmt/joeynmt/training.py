@@ -457,7 +457,7 @@ class TrainManager:
 
     def make_small_data(self, data,
                         small_data_size=30, small_epochs=3, batch_size_dividor=5):
-        logger.info(f"The lenght of small data is {small_data_size}")
+        logger.info(f"The length of small data is {small_data_size}")
         self.batch_size = small_data_size // batch_size_dividor
         # self.epochs = small_epochs
         self.validation_freq = 10000
@@ -497,7 +497,7 @@ class TrainManager:
         # init utility_fn
         if self.utility_regularising:
             self.model.loss_function._utility_fn = [get_utility_fn(self.utility_type) for _ in range(mp.cpu_count() // self.world_size)]
-
+            self.model.loss_function._world_size = self.world_size
         # data handling
         if self.distributed_batch_sampler:
             self.batch_sampler = DistributedBatchSamplerSimilarLength(train_data, num_replicas=self.world_size,
