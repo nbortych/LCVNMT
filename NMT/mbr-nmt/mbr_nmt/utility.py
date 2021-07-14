@@ -167,6 +167,7 @@ class BEER:
         :param hyp: hypothesis, list of tokens (strings).
         :param ref: reference, list of tokens (strings).
         """
+        if len(hyp) == 0 or len(ref) == 0: return 0.
         self.lock.acquire()
         self.proc.stdin.write("EVAL ||| {} ||| {}\n".format(" ".join(hyp), " ".join(ref)).encode("utf-8"))
         self.proc.stdin.flush()
