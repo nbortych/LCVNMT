@@ -114,7 +114,7 @@ class RecurrentEncoder(Encoder):
         embed_src = self.emb_dropout(embed_src)
 
         packed = pack_padded_sequence(embed_src, src_length.cpu(),
-                                      batch_first=True)
+                                      batch_first=True, enforce_sorted=False)
         output, hidden = self.rnn(packed)
 
         #pylint: disable=unused-variable

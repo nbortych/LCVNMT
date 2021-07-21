@@ -203,63 +203,6 @@ def make_dataloader(dataset: Dataset,
     return dataloader
 
 
-class BatchSamplerSimilarLength(Sampler):
-    def __init__(self, dataset, batch_size, indices=None, shuffle=True):
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        # get the indicies and length
-        if indices is None:
-            self.indices = [(i, src_len) for i, (src, src_len, trg, trg_len) in enumerate(dataset)]
-        else:
-            self.indices = indices
-
-    def __iter__(self):
-        if self.shuffle:
-            random.shuffle(self.indices)
-
-        pooled_indices = []
-        # create pool of indices with similar lengths
-        for i in range(0, len(self.indices), self.batch_size * 100):
-            pooled_indices.extend(sorted(self.indices[i:i + self.batch_size * 100], key=lambda x: x[1]))
-        self.pooled_indices = [x[0] for x in pooled_indices]
-
-        # yield indices for current batch
-        batches = [self.pooled_indices[i:i + self.batch_size] for i in
-                   range(0, len(self.pooled_indices), self.batch_size)]
-
-        if self.shuffle:
-            random.shuffle(batches)
-        for batch in batches:
-            yield batch
-
-    def __len__(self):
-        return len(self.pooled_indices) // self.batch_size
-
-
-class DistributedBatchSamplerSimilarLength(DistributedSampler):
-    def __init__(self, dataset: Dataset, num_replicas: Optional[int] = None,
-                 rank: Optional[int] = None, shuffle: bool = True,
-                 seed: int = 0, drop_last: bool = False, batch_size=10) -> None:
-        super().__init__(dataset=dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle, seed=seed,
-                         drop_last=drop_last)
-        self.batch_size = batch_size
-        self.indices = torch.tensor([(i, src_len) for i, (src, src_len, trg, trg_len) in enumerate(dataset)])
-
-        logger.info(f"indices length total {len(self.indices)}")
-
-    def __iter__(self):
-        # get indices that will be processed by this rank
-        indices_on_this_rank = list(super().__iter__())
-        logger.info(f"indices length subset on this rank {len(indices_on_this_rank)}")
-        # subsample full indices
-        indices = copy.deepcopy(self.indices[indices_on_this_rank].tolist())
-        logger.info(f"indices length subset {len(indices)}")
-        batch_sampler = BatchSamplerSimilarLength(self.dataset, batch_size=self.batch_size, indices=indices)
-        return iter(batch_sampler)
-
-    def __len__(self) -> int:
-        return self.num_samples // batch_size
-
 
 class TranslationTextDataset(Dataset):
     """Defines an abstraction for text iterable datasets.
@@ -310,6 +253,63 @@ class TranslationTextDataset(Dataset):
     def __str__(self):
         return self.description
 
+
+class BatchSamplerSimilarLength(Sampler):
+    def __init__(self, dataset, batch_size, indices=None, shuffle=True):
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        # get the indicies and length
+        if indices is None:
+            self.indices = [(i, src_len) for i, (src, src_len, trg, trg_len) in enumerate(dataset)]
+        else:
+            self.indices = indices
+
+    def __iter__(self):
+        if self.shuffle:
+            random.shuffle(self.indices)
+
+        pooled_indices = []
+        # create pool of indices with similar lengths
+        for i in range(0, len(self.indices), self.batch_size * 100):
+            pooled_indices.extend(sorted(self.indices[i:i + self.batch_size * 100], key=lambda x: x[1]))
+        self.pooled_indices = [x[0] for x in pooled_indices]
+
+        # yield indices for current batch
+        batches = [self.pooled_indices[i:i + self.batch_size] for i in
+                   range(0, len(self.pooled_indices), self.batch_size)]
+
+        if self.shuffle:
+            random.shuffle(batches)
+        for batch in batches:
+            yield batch
+
+    def __len__(self):
+        return len(self.pooled_indices) // self.batch_size
+
+
+class DistributedBatchSamplerSimilarLength(DistributedSampler):
+    def __init__(self, dataset: Dataset, num_replicas: Optional[int] = None,
+                 rank: Optional[int] = None, shuffle: bool = True,
+                 seed: int = 0, drop_last: bool = False, batch_size=10) -> None:
+        super().__init__(dataset=dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle, seed=seed,
+                         drop_last=drop_last)
+        self.batch_size = batch_size
+        self.indices = torch.tensor([(i, src_len) for i, (src, src_len, trg, trg_len) in enumerate(dataset)])
+
+        logger.info(f"indices length total {len(self.indices)}")
+
+    def __iter__(self):
+        # get indices that will be processed by this rank
+        indices_on_this_rank = list(super().__iter__())
+        # logger.info(f"indices length subset on this rank {len(indices_on_this_rank)}")
+        # subsample full indices
+        indices = copy.deepcopy(self.indices[indices_on_this_rank].tolist())
+        # logger.info(f"indices length subset {len(indices)}")
+        batch_sampler = BatchSamplerSimilarLength(self.dataset, batch_size=self.batch_size, indices=indices)
+        return iter(batch_sampler)
+
+    def __len__(self) -> int:
+        return self.num_samples // batch_size
 
 class MonoDataset(Dataset):
     """Defines a dataset for machine translation without targets."""

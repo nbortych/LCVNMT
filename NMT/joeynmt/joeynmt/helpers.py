@@ -374,3 +374,11 @@ def debug_memory():
                                   if torch.is_tensor(o))
     for line in tensors.items():
         print('{}\t{}'.format(*line), flush=True)
+
+
+def repeat_batch(batch, num_repeats):
+    batch.src = batch.src.repeat(num_repeats, 1)
+    batch.src_mask = batch.src_mask.repeat(num_repeats, 1, 1)
+    batch.trg_mask = batch.trg_mask.repeat(num_repeats, 1, 1)
+    batch.src_length = batch.src_length.repeat(num_repeats)
+    return batch

@@ -19,7 +19,7 @@ from torch.utils.data import Dataset, Subset
 # from torch.utils.data.distributed import DistributedSampler
 
 from joeynmt.helpers import bpe_postprocess, load_config, make_logger, \
-    get_latest_checkpoint, load_checkpoint, store_attention_plots, debug_memory
+    get_latest_checkpoint, load_checkpoint, store_attention_plots, debug_memory, repeat_batch
 from joeynmt.metrics import bleu, chrf, token_accuracy, sequence_accuracy
 from joeynmt.model import build_model, Model, _DataParallel
 from joeynmt.search import run_batch
@@ -100,7 +100,9 @@ def validate_on_data(model: Model, data: Dataset,
         - decoded_valid: raw validation hypotheses (before post-processing),
         - valid_attention_scores: attention scores for validation hypotheses
     """
-    assert batch_size >= n_gpu, "batch_size must be bigger than n_gpu."
+    model.ddp = getattr(model, "ddp", False)
+    if not model.ddp:
+        assert batch_size >= n_gpu, "batch_size must be bigger than n_gpu."
     if sacrebleu is None:  # assign default value
         sacrebleu = {"remove_whitespace": True, "tokenize": "13a"}
     if batch_size > 1000 and batch_type == "sentence":
@@ -120,10 +122,9 @@ def validate_on_data(model: Model, data: Dataset,
         val_subset_data.src_vocab = data.src_vocab
         val_subset_data.trg_vocab = data.trg_vocab
         data = val_subset_data
-        logger.info(f"The lenght of validation data for small test run is {len(data)}")
+        logger.info(f"The length of validation data for small test run is {len(data)}")
         # batch_size = len(data)
 
-    model.ddp = getattr(model, "ddp", False)
     if model.ddp:
         ddp_sampler = DistributedEvalSampler(data, num_replicas=world_size, rank=rank)
         ddp_indices = ddp_sampler.indices
@@ -180,14 +181,16 @@ def validate_on_data(model: Model, data: Dataset,
                     beam_alpha=beam_alpha, max_output_length=max_output_length, sample=sample)
             else:
                 # logger.info(f"Validation batch {i}/{len(valid_dataloader)}, rank {rank}")
-                output, expected_utility = mbr_decoding(model=model, batch=batch, max_output_length=max_output_length,
-                                                        compute_log_probs=False, need_grad=False,
-                                                        return_types=["h", "mean_batch_expected_uility_h"],
-                                                        num_samples=num_samples, mbr_type=mbr_type,
-                                                        utility_type=utility_type,
-                                                        utility_fn=utility_fn,
-                                                        encoded_batch=[encoder_output, encoder_hidden],
-                                                        small_test_run=small_test_run, rank=rank, world_size=world_size)
+                mbr_dict = mbr_decoding(model=model, batch=batch, max_output_length=max_output_length,
+                                        compute_log_probs=False, need_grad=False,
+                                        return_types=["h", "mean_batch_expected_uility_h"],
+                                        num_samples=num_samples, mbr_type=mbr_type,
+                                        utility_type=utility_type,
+                                        utility_fn=utility_fn,
+                                        encoded_batch=[encoder_output, encoder_hidden],
+                                        small_test_run=small_test_run, rank=rank, world_size=world_size)
+
+                output, expected_utility = mbr_dict['h'], mbr_dict['mean_batch_expected_uility_h']
                 attention_scores = None
                 expected_utility_total += expected_utility
             # sort outputs back to original order
@@ -201,12 +204,12 @@ def validate_on_data(model: Model, data: Dataset,
         if model.ddp:
             data = Subset(data, indices=ddp_indices)
         assert len(all_outputs) == len(data)
-        expected_utility_mean = expected_utility_total/len(valid_dataloader)
+        expected_utility_mean = expected_utility_total / len(valid_dataloader)
         if compute_loss and total_ntokens > 0:
             # exponent of token-level negative log prob
             valid_ppl = torch.exp(total_loss / total_ntokens).item()
             # total validation loss
-            valid_loss = total_loss.item()
+            valid_loss = total_loss.item() / len(valid_dataloader)
 
         else:
             valid_loss = -1
@@ -650,46 +653,50 @@ def get_utility_of_samples(utility_type, sample_1, sample_2, reduce_type="mean",
 def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="editdistance",
                  utility_type="editdistance", utility_fn=None, return_types=("h",),
                  need_grad=False, compute_log_probs=False, encoded_batch=None, small_test_run=False,
-                 rank=None, world_size=1):
-    set_of_possible_returns = {"h", "samples", "utilities", "log_probabilities", "mean_batch_expected_uility_h"}
+                 rank=None, world_size=1, samples_raw = None):
+    set_of_possible_returns = {"h", "samples", "samples_raw", "utilities", "log_probabilities",
+                               "mean_batch_expected_uility_h"}
     assert len(set(return_types) - set_of_possible_returns) == 0, f"You have specified wrong return types. " \
                                                                   f"Make sure it's one (or more) out of {set_of_possible_returns}"
     # sample S samples of translation y|x  using  run_batch
 
     # copy batch num_samples times to sample
     batch_size = batch.src.shape[0]
-    batch.src = batch.src.repeat(num_samples, 1)
-    batch.src_mask = batch.src_mask.repeat(num_samples, 1, 1)
-    batch.trg_mask = batch.trg_mask.repeat(num_samples, 1, 1)
-    if encoded_batch is not None and encoded_batch[0] is not None:
-        try:
-            encoded_batch[0] = encoded_batch[0].repeat(num_samples, 1, 1)
-        except:
-            pass
-        try:
-            encoded_batch[1] = encoded_batch[1].repeat(num_samples, 1, 1)
-        except:
-            pass
+
+
+    if samples_raw is None:
+        # be careful! the batch is modified
+        batch = repeat_batch(batch, num_samples)
+        if encoded_batch is not None and encoded_batch[0] is not None:
+            try:
+                encoded_batch[0] = encoded_batch[0].repeat(num_samples, 1, 1)
+            except:
+                pass
+            try:
+                encoded_batch[1] = encoded_batch[1].repeat(num_samples, 1, 1)
+            except:
+                pass
+        else:
+            encoded_batch = None
+        # [B*SxL, B*S]
+        samples_raw, log_probs = run_batch(model, batch, max_output_length=max_output_length, beam_size=1, beam_alpha=1,
+                                           sample=True, need_grad=need_grad, compute_log_probs=compute_log_probs,
+                                           encoded_batch=encoded_batch)
     else:
-        encoded_batch = None
-    # [B*SxL, B*S]
-    samples, log_probs = run_batch(model, batch, max_output_length=max_output_length, beam_size=1, beam_alpha=1,
-                                   sample=True, need_grad=need_grad, compute_log_probs=compute_log_probs,
-                                   encoded_batch=encoded_batch)
-    # if rank is not None:
+        assert samples_raw[0].shape == batch_size*num_samples, "Something is wrong with sample shape"
+        log_probs = None
+        # if rank is not None:
     # logger.info(f"got samples rank {rank}")
 
     # [BxSxL] transpose is needed to make sure that it's actually split by batches
-    samples = samples.reshape(num_samples, batch_size, -1).transpose((1, 0, 2))
-    if "log_probabilities" in return_types:
+    samples = samples_raw.reshape(num_samples, batch_size, -1).transpose((1, 0, 2))
+    if "log_probabilities" in return_types and compute_log_probs:
         # [BxS]
         log_probs = log_probs.reshape(batch_size, num_samples)
 
     if mbr_type == "editdistance":
         # define utility function
-        # todo check if the java problem is due to this
         if utility_fn is None:
-            # logger.info(f"Loading utility {utility_type}")
             utility_fn = get_utility_fn(utility_type)
         # transform indices to str [BxS]
         decoded_samples = [
@@ -728,15 +735,20 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
                 # number of examples per thread
                 num_per_thread = int(np.ceil(len(batch_combinations_of_samples) / cpus))
                 # chunk the batch for each thread and combine with specififc utility process
-                chunked_batches =  [batch_combinations_of_samples[i:i + num_per_thread]
-                                    for i in
-                                    range(0, len(batch_combinations_of_samples), num_per_thread)]
-                logger.info(f"Batch size{ len(chunked_batches)}, utility_fn {len(utility_fn)}, num per thread {num_per_thread}")
-                chunked_utility_fns_and_batches = [(chunked_batches[i], utility_fn[i]) for i in range(len(chunked_batches))]
+                chunked_batches = [batch_combinations_of_samples[i:i + num_per_thread]
+                                   for i in range(0, len(batch_combinations_of_samples), num_per_thread)]
+                # logger.info(
+                #     f"Chunki batch len {len(chunked_batches)}, "
+                #     f"Combi batch len {len(batch_combinations_of_samples)}, "
+                #     f"Utility_fn len {len(utility_fn)},"
+                #     f"Cpus {cpus}, "
+                #     f" num per thread {num_per_thread}")
+                chunked_batches_and_utility_fns = [(chunked_batches[i], utility_fn[i]) for i in
+                                                   range(len(chunked_batches))]
 
                 # multithread
                 with ThreadPool(cpus) as p:
-                    utilities = p.map(eval_utility_batches_threads, chunked_utility_fns_and_batches)
+                    utilities = p.map(eval_utility_batches_threads, chunked_batches_and_utility_fns)
                 # flatten the list and wrap in a tensor
                 utilities = torch.tensor([u for sublist in utilities for u in sublist], dtype=torch.float)
 
@@ -752,26 +764,28 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
         else:
             best_idx = torch.argmax(expected_uility, dim=-1)
         # return things that you want to return
-        return_list = []
+        return_dict = {}
         if "h" in return_types:
             # get prediction with best samples
             prediction = samples[np.arange(batch_size), best_idx.numpy()]
-            return_list.append(prediction)
+            return_dict['h'] = prediction
         if "samples" in return_types:
-            return_list.append(samples)
+            return_dict['samples'] = samples
+        if "samples_raw" in return_types:
+            return_dict['samples_raw'] = samples_raw
         if "utilities" in return_types:
             best_idx = best_idx.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, num_samples)
             # [BxS]
             u_h = U.gather(1, best_idx).squeeze(1)
             # print("u_h", u_h)
-            # u_h = u_h + 1e-10
-            return_list.append(u_h)
+            u_h = u_h + 1e-10
+            return_dict['utilities'] = u_h
         if "log_probabilities" in return_types:
-            return_list.append(log_probs)
+            return_dict['log_probabilities'] = log_probs
         if "mean_batch_expected_uility_h" in return_types:
-            logger.info(f"best_idx {best_idx} expected_utility shape {expected_uility.shape}")
-            return_list.append(torch.mean(expected_uility[:,best_idx].detach()))
-        return return_list
+            # logger.info(f"best_idx {best_idx} expected_utility shape {expected_uility.shape}")
+            return_dict['mean_batch_expected_uility_h'] = torch.mean(expected_uility[:, best_idx].detach())
+        return return_dict
 
 
     else:
@@ -828,8 +842,7 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
 
 
 def eval_utility_batches_threads(batches_and_fn):
-    utility_fn = batches_and_fn[1]
-    batches = batches_and_fn[0]
+    batches, utility_fn = batches_and_fn
     utility = [list(itertools.starmap(utility_fn, combinations_of_samples)) for
                combinations_of_samples in batches]
     return utility

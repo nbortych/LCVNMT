@@ -148,6 +148,8 @@ class TrainManager:
         self.optimizer = build_optimizer(config=train_config,
                                          parameters=model.parameters())
 
+        self.ppo_k = train_config.get("ppo_k", 0)
+
         # validation & early stopping
         self.track_mbr = train_config.get("track_mbr", False)
         self.utility_type = train_config.get("utility", "editdistance")
@@ -473,7 +475,7 @@ class TrainManager:
             amp.load_state_dict(model_checkpoint['amp_state'])
 
     def make_small_data(self, data,
-                        small_data_size=30, small_epochs=3, batch_size_dividor=5):
+                        small_data_size=40, small_epochs=3, batch_size_dividor=5):
         logger.info(f"The length of small data is {small_data_size}")
         self.batch_size = small_data_size // batch_size_dividor
         # self.epochs = small_epochs
@@ -777,46 +779,52 @@ class TrainManager:
         """
         # reactivate training
         self.model.train()
+        batch_loss_over_k = torch.empty(self.ppo_k)
         # get loss
-        batch_loss, log_dict, _, _ = self.model(return_type="loss",
-                                                **{"batch": batch,
-                                                   "utility_regularising": self.utility_regularising,
-                                                   'utility_type': self.utility_type,
-                                                   **vars(batch)})
+        for i in range(self.ppo_k):
+            batch_loss, log_dict, _, _ = self.model(return_type="loss",
+                                                    **{"batch": batch,
+                                                       "utility_regularising": self.utility_regularising,
+                                                       'utility_type': self.utility_type,
+                                                       **vars(batch)})
 
-        # sum multi-gpu losses
-        if self.n_gpu > 1 and not self.ddp:
-            batch_loss = batch_loss.sum()
+            # sum multi-gpu losses
+            if self.n_gpu > 1 and not self.ddp:
+                batch_loss = batch_loss.sum()
 
-        # normalize batch loss
-        if self.normalization == "batch":
-            normalizer = batch.nseqs
-        elif self.normalization == "tokens":
-            normalizer = batch.ntokens
-        elif self.normalization == "none":
-            normalizer = 1
-        else:
-            raise NotImplementedError("Only normalize by 'batch' or 'tokens' "
-                                      "or summation of loss 'none' implemented")
+            # normalize batch loss
+            if self.normalization == "batch":
+                normalizer = batch.nseqs
+            elif self.normalization == "tokens":
+                normalizer = batch.ntokens
+            elif self.normalization == "none":
+                normalizer = 1
+            else:
+                raise NotImplementedError("Only normalize by 'batch' or 'tokens' "
+                                          "or summation of loss 'none' implemented")
 
-        norm_batch_loss = batch_loss / normalizer
+            norm_batch_loss = batch_loss / normalizer
 
-        if self.n_gpu > 1 and not self.ddp:
-            norm_batch_loss = norm_batch_loss / self.n_gpu
+            if self.n_gpu > 1 and not self.ddp:
+                norm_batch_loss = norm_batch_loss / self.n_gpu
 
-        if self.batch_multiplier > 1:
-            norm_batch_loss = norm_batch_loss / self.batch_multiplier
+            if self.batch_multiplier > 1:
+                norm_batch_loss = norm_batch_loss / self.batch_multiplier
 
-        # accumulate gradients
-        if self.fp16:
-            with amp.scale_loss(norm_batch_loss, self.optimizer) as scaled_loss:
-                scaled_loss.backward()
-        else:
-            norm_batch_loss.backward()
+            # accumulate gradients
+            if self.fp16:
+                with amp.scale_loss(norm_batch_loss, self.optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                norm_batch_loss.backward()
+            # increment token counter
+            self.stats.total_tokens += batch.ntokens
 
-        # increment token counter
-        self.stats.total_tokens += batch.ntokens
+            batch_loss_over_k[i]=norm_batch_loss.item()
 
+
+        norm_batch_loss = batch_loss_over_k
+        #todo what happens with log _dict
         return norm_batch_loss.item(), log_dict
 
     def _synch_reduce_ddp(self, score, reduce_type="mean"):
