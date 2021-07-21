@@ -365,8 +365,8 @@ class TrainManager:
                 self.epoch_no,
             'ddp':
                 self.ddp,
-            "scores_queue":
-                self.stats.previous_scores_queue
+            "scores_counter":
+                self.stats.scores_counter
         }
 
         torch.save(state, model_path)
@@ -448,11 +448,14 @@ class TrainManager:
         # restore counts
         self.stats.steps = model_checkpoint["steps"]
         self.stats.total_tokens = model_checkpoint["total_tokens"]
-        self.stats.previous_scores_queue = model_checkpoint["scores_queue"]
-
+        self.stats.scores_counter = model_checkpoint["scores_counter"]
+        # logger.info(f"Previous scores are the following {model_checkpoint['scores_queue']}")
         if not reset_best_ckpt:
             self.stats.best_ckpt_score = model_checkpoint["best_ckpt_score"]
             self.stats.best_ckpt_iter = model_checkpoint["best_ckpt_iteration"]
+            logger.info(
+                f"Previous best score is  {model_checkpoint['best_ckpt_score']} at iteration {model_checkpoint['best_ckpt_iteration']}")
+
         else:
             logger.info("Reset tracking of the best checkpoint.")
 
@@ -1152,10 +1155,7 @@ class TrainManager:
 
             # early stopping stats
             self.early_stopping_patience = early_stopping_patience
-            if self.minimize_metric:
-                self.previous_scores_queue = [np.inf] * self.early_stopping_patience
-            else:
-                self.previous_scores_queue = [-np.inf] * self.early_stopping_patience
+            self.scores_counter = 0
             # reason for stopping
             self.early_stopping = False
 
@@ -1163,22 +1163,31 @@ class TrainManager:
             is_best = self.comparison(score, self.best_ckpt_score)
             return is_best
 
+        # def early_stopping_step(self, score):
+        #     # remove the oldest element in the queue
+        #     self.previous_scores_queue.pop(0)
+        #     # append the score
+        #     self.previous_scores_queue.append(score)
+        #     # shall we stop?
+        #     self.early_stopping = True
+        #     # compare each element sequentially. if it does not improve, early stop
+        #     for i, previous_score in enumerate(self.previous_scores_queue[:-1]):
+        #         next_score = self.previous_scores_queue[i + 1]
+        #         is_improving = self.comparison(next_score, previous_score)
+        #         if is_improving:
+        #             self.early_stopping = False
+        #     # stop
+        #     if self.early_stopping:
+        #         self.stop = True
         def early_stopping_step(self, score):
-            # remove the oldest element in the queue
-            self.previous_scores_queue.pop(0)
-            # append the score
-            self.previous_scores_queue.append(score)
-            # shall we stop?
-            self.early_stopping = True
-            # compare each element sequentially. if it does not improve, early stop
-            for i, previous_score in enumerate(self.previous_scores_queue[:-1]):
-                next_score = self.previous_scores_queue[i + 1]
-                is_improving = self.comparison(next_score, previous_score)
-                if is_improving:
-                    self.early_stopping = False
-            # stop
-            if self.early_stopping:
+            if self.is_best(score):
+                self.scores_counter = 0
+            else:
+                self.scores_counter += 1
+            if self.scores_counter >= self.early_stopping_patience:
                 self.stop = True
+                self.early_stopping = True
+                logger.info(f"Early stopping the training, best score is {self.best_ckpt_score:.4f}")
 
 
 def train(cfg_file: str) -> None:
