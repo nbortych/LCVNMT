@@ -123,6 +123,18 @@ class TrainManager:
                                             max_output_length=self.max_output_length,
                                             mean_baseline=self._mean_baseline,
                                             vimco_baseline=self._vimco_baseline)
+
+        # thresholding
+        self.utility_threshold = train_config.get("regulariser_utility_threshold", 0.0)
+        self.epoch_threshold = train_config.get("regulariser_epoch_threshold", 0)
+        if self.utility_regularising == False:
+            self.utility_threshold == 0
+
+        if self.utility_threshold != 0 or self.epoch_threshold!=0:
+            self.utility_regularising = False
+
+        self.threshold_passed = False
+
         self.normalization = train_config.get("normalization", "batch")
         if self.normalization not in ["batch", "tokens", "none"]:
             raise ConfigurationError("Invalid normalization option."
@@ -247,13 +259,13 @@ class TrainManager:
         self.rank = None
         self.num_nodes = train_config.get("num_nodes", 1)
         self.node_nr = train_config.get("node_nr", 0)
-        self.world_size = self.num_nodes * self.n_gpu if self.n_gpu>0 else 1
+        self.world_size = self.num_nodes * self.n_gpu if self.n_gpu > 0 else 1
         self.distributed_batch_sampler = train_config.get("distributed_batch_sampler", False)
         self.child_conn = None  # set by child process in case of ddp
         # initialise the utility function
-        if not self.ddp and self.utility_regularising:
+        if not self.ddp and (self.utility_regularising or self.utility_threshold != 0 or self.epoch_threshold!=0):
             self.model.loss_function._utility_fn = [get_utility_fn(self.utility_type) for _ in range(mp.cpu_count())]
-        #get_utility_fn(self.utility_type)
+        # get_utility_fn(self.utility_type)
         # if self.use_cuda:
         #     torch.cuda.empty_cache()
         if self.use_cuda and not self.ddp:
@@ -311,7 +323,7 @@ class TrainManager:
         wandb.login(key=api_key)
         wandb.init(project="lcv-nmt", config=config, id = "baseline0", resume=True)
 
-    def _save_checkpoint(self, new_best: bool = True) -> None:
+    def _save_checkpoint(self, new_best: bool = True, pre_calibration=False) -> None:
         """
         Save the model's current parameters and the training state to a
         checkpoint.
@@ -325,7 +337,7 @@ class TrainManager:
           new checkpoint. If it is true, we update best.ckpt, else latest.ckpt.
         """
         model_path = os.path.join(self.model_dir,
-                                  "{}.ckpt".format(self.stats.steps))
+                                  "{}.ckpt".format('precalibrated' if pre_calibration else self.stats.steps))
         model_state_dict = self.model.module.state_dict() \
             if isinstance(self.model, torch.nn.DataParallel) or \
                isinstance(self.model, torch.nn.parallel.DistributedDataParallel) \
@@ -377,7 +389,7 @@ class TrainManager:
                 # overwrite best.ckpt
                 torch.save(state, best_path)
 
-        if self.save_latest_checkpoint:
+        if self.save_latest_checkpoint and not pre_calibration:
             last_path = "{}/latest.ckpt".format(self.model_dir)
             previous_path = latest_checkpoint_update(symlink_target, last_path)
             # If the last ckpt is in the ckpt_queue, we don't want to delete it.
@@ -495,9 +507,11 @@ class TrainManager:
         # wrap in DDP
         self.model = _DistributedDataParallel(self.model, device_ids=[gpu])
         # init utility_fn
-        if self.utility_regularising:
-            self.model.loss_function._utility_fn = [get_utility_fn(self.utility_type) for _ in range(mp.cpu_count() // self.world_size)]
+        if self.utility_regularising or self.utility_threshold != 0 or self.epoch_threshold!=0:
+            self.model.loss_function._utility_fn = [get_utility_fn(self.utility_type) for _ in
+                                                    range(mp.cpu_count() // self.world_size)]
             self.model.loss_function._world_size = self.world_size
+
         # data handling
         if self.distributed_batch_sampler:
             self.batch_sampler = DistributedBatchSamplerSimilarLength(train_data, num_replicas=self.world_size,
@@ -706,7 +720,11 @@ class TrainManager:
             else:
                 # if not self.ddp or self.rank == 0:
                 epoch_duration = time.time() - start - total_valid_duration + epoch_duration
-
+                # turn on validation and save the precomputed epoch
+                if epoch_no>=self.epoch_threshold and self.epoch_threshold !=0 and not self.threshold_passed:
+                    self.utility_regularising = True
+                    self.threshold_passed = True
+                    self._save_checkpoint(False, pre_calibration=True)
                 logger.info(
                     f"End of epoch {epoch_no + 1}, it took {epoch_duration:.3f}. Epoch loss is {epoch_loss:.4f}. "
                     f"Rank is {0 if self.rank is None else self.rank}")
@@ -929,6 +947,16 @@ class TrainManager:
         else:
             ckpt_score = valid_score
 
+        # threshold for utility regularisation:
+        if self.utility_threshold <= valid_utility and self.utility_threshold != 0 and not self.threshold_passed:
+            logger.info(
+                f"Achieved validation utility of {valid_utility}, utility threshold is {self.utility_threshold},"
+                f" so we turn on the regularisation")
+            self.utility_regularising = True
+            self.threshold_passed = True
+            self._save_checkpoint(False, pre_calibration=True)
+
+        # lr scheduler
         if self.scheduler is not None and self.scheduler_step_at == "validation" and make_decision:
             self.scheduler.step(ckpt_score)
 
