@@ -45,7 +45,7 @@ def greedy(src_mask: Tensor, max_output_length: int, model: Model,
         src_mask, max_output_length, model, encoder_output, encoder_hidden, sample, need_grad=need_grad,
         compute_log_probs=compute_log_probs)
 
-
+# todo make like transformer: add compute log probs and need grad
 def recurrent_greedy(
         src_mask: Tensor, max_output_length: int, model: Model,
         encoder_output: Tensor, encoder_hidden: Tensor, sample: bool = False, need_grad=False,
@@ -90,7 +90,12 @@ def recurrent_greedy(
             # logits: batch x time=1 x vocab (logits)
 
         # greedy decoding: choose arg max over vocabulary in each step
-        next_word = torch.argmax(logits, dim=-1)  # batch x time=1
+        if not sample:
+            next_word = torch.argmax(logits, dim=-1)  # batch x time=1
+        else:
+            py_x = Categorical(logits=logits)
+            next_word = py_x.sample()
+            next_word = next_word.data
         output.append(next_word.squeeze(1).detach().cpu().numpy())
         prev_y = next_word
         attention_scores.append(att_probs.squeeze(1).detach().cpu().numpy())
