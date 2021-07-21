@@ -8,7 +8,11 @@ from math import log
 
 from torch import nn, Tensor
 from torch.autograd import Variable
+from torch.nn.utils.rnn import pad_sequence
+
 from joeynmt.prediction import mbr_decoding
+from joeynmt.helpers import repeat_batch
+from joeynmt.batch import Batch
 
 
 class XentLoss(nn.Module):
@@ -28,6 +32,9 @@ class XentLoss(nn.Module):
         else:  # reguralizing
             # custom label-smoothed loss, computed with KL divergence loss
             self.criterion = nn.KLDivLoss(reduction='sum')
+
+        self.no_reduce_criterion = nn.NLLLoss(ignore_index=self.pad_index,
+                                              reduction='none')
         # regularisation strength
         self.utility_alpha = utility_alpha
         # number of samples to compute the utility reg
@@ -44,32 +51,78 @@ class XentLoss(nn.Module):
         self._utility_fn = None
         self._world_size = 1
 
-    def utility_loss(self, model, batch, batch_loss, utility_type='beer', encoded_batch = None ):
+    @staticmethod
+    def prepare_samples_for_batch( samples, bos, eos, pad):
+
+        def tensor_of_shape_x_and_all_elements_are_y(x,y):
+            tensor_xy = torch.empty(x)
+            tensor_xy[:] = y
+            return tensor_xy.view(x,1)
+
+        # print(samples.shape, "is samples shape")
+        # print(samples)
+
+        lengths = tensor_of_shape_x_and_all_elements_are_y(samples.shape[0],samples.shape[1]).to(torch.int32)
+        # appending bos and and eos
+        bos_tensor = tensor_of_shape_x_and_all_elements_are_y(samples.shape[0], bos)
+        eos_tensor = tensor_of_shape_x_and_all_elements_are_y(samples.shape[0], eos)
+        # print(bos_tensor.shape, samples.shape)
+        bos_samples =torch.cat((bos_tensor, torch.tensor(samples)), dim=1)
+        # print(bos_samples.shape)
+        bos_samples_eos = torch.cat((bos_samples, eos_tensor), dim= 1)
+        # print("shape after cating", bos_samples_eos.shape)
+        # padding
+        padded_samples = pad_sequence(bos_samples_eos, batch_first=True, padding_value=pad).to(torch.long)
+        # print(f"shaper after padding, {padded_samples.shape}")
+        return padded_samples, lengths
+
+
+    def utility_loss(self, model, batch, batch_loss, utility_type='beer', encoded_batch=None, samples_raw = None):
         log_dict = {"nll": batch_loss.item()}
         # reinforce: \delta E = E_{p(y|\theta, x)} [log u(y,h) * \delta log p (y|\theta, x)]
         from joeynmt.prediction import mbr_decoding
         # compute mbr, get utility(samples, h)
         # todo pass encode batch to save computations
-        u_h, sample_log_probs = mbr_decoding(model, batch, max_output_length=self.max_output_length,
-                                             num_samples=self.num_samples,
-                                             mbr_type="editdistance", utility_type=utility_type,
-                                             return_types=("utilities", "log_probabilities"),
-                                             need_grad=True, compute_log_probs=True,
-                                             encoded_batch=encoded_batch, utility_fn=self._utility_fn,
-                                             world_size=self._world_size)
+        with torch.no_grad():
+            mbr_dict = mbr_decoding(model, batch, max_output_length=self.max_output_length,
+                                num_samples=self.num_samples,
+                                mbr_type="editdistance", utility_type=utility_type,
+                                return_types=("utilities", "samples_raw"),
+                                need_grad=False, compute_log_probs=False,
+                                encoded_batch=encoded_batch, utility_fn=self._utility_fn,
+                                world_size=self._world_size, samples_raw = samples_raw)
 
-        # log_uh = torch.log(u_h).detach()
+            # [BxS], [S*BxL]
+            u_h, samples = mbr_dict['utilities'], mbr_dict['samples_raw']
+        # self.src, self.src_length, self.trg, self.trg_length
+        # print("batch before repeat batch", batch.src.shape, batch.src_length.shape)
+        trg_sampled, trg_length  = self.prepare_samples_for_batch(samples, model.bos_index, model.eos_index, model.pad_index)
+        # [S*BxL]
+        new_batch = Batch((batch.src, batch.src_length, trg_sampled, trg_length), pad_index=model.pad_index,
+                          use_cuda=batch.src.is_cuda, device=batch.src.device)
+        # print("batch after repeat batch", batch.src.shape, batch.src_length.shape)
+        sample_log_probs,_,_,_ = model(return_type="log_prob",
+                                 **{"utility_regularising": False,
+                                    **vars(new_batch)})
+        sample_log_probs = sample_log_probs.reshape((batch.src.shape[0]//self.num_samples, self.num_samples, -1))
+        sample_log_probs_per_sentence = sample_log_probs.sum(-1)
+
+        # computing utility
+        # utility logging (pun intended)
+        log_uh = torch.log(u_h).detach()
         log_dict['u_h'] = u_h.detach().clone().mean(dim=1).numpy()
         log_dict['mean_utility'] = u_h.mean().item()
+        log_dict['log_u_h'] = log_uh.mean().item()
+        # control variates for utility
+
         # VIMCO control variate from arxiv.org/pdf/1602.06725.pdf
         # vimco_baseline_j = log (\sum_i^{-j} u_i + mean^{-j}) -logS
-        # todo maybe log sum exp + log sub exp !
-        # todo look into beer range
+
         if self.vimco_baseline:
             # get all the utilities in the sample[B]
-            total_utility = torch.sum(u_h, dim=1)
+            total_utility = torch.sum(log_uh, dim=1)
             # substract the jth element at the jth index [B,S]
-            sum_min_j = total_utility.unsqueeze(-1) - u_h
+            sum_min_j = total_utility.unsqueeze(-1) - log_uh
             # get the mean without the jth
             mean_min_j = sum_min_j - log(self.num_samples - 1)
             # baseline is the sum without the jth + mean without the jth
@@ -77,8 +130,8 @@ class XentLoss(nn.Module):
         else:
             vimco_baseline = 0
         # substract the vimco baseline
-        u_h = u_h - vimco_baseline
-        log_dict['mean_vimco_utility'] = u_h.mean().item()
+        log_uh = log_uh - vimco_baseline
+        log_dict['mean_vimco_utility'] = log_uh.mean().item()
         log_dict['mean_vimco'] = vimco_baseline.mean().item()
 
         # if we use mean control variate, substract the current mean and then update the mean
@@ -87,24 +140,25 @@ class XentLoss(nn.Module):
             mean_baseline = self._utility_running_average
             # update running mean += (utility_sample_mean - running mean)/N
             self._utility_step += 1
-            self._utility_running_average += (torch.mean(u_h).item() - self._utility_running_average) \
+            self._utility_running_average += (torch.mean(log_uh).item() - self._utility_running_average) \
                                              / self._utility_step
         else:
             mean_baseline = 0
         log_dict['mean_baseline'] = mean_baseline
         # substract the mean baseline
-        u_h = u_h - mean_baseline
-        log_dict['mean_utility_after_baselines'] = u_h.mean().item()
+        log_uh = log_uh - mean_baseline
+        log_dict['mean_utility_after_baselines'] = log_uh.mean().item()
         # compute mean of U(y,h) * \grad p(y)
-        utility_term = torch.mean(u_h.to(sample_log_probs.device) * sample_log_probs)
+        utility_term = torch.mean(log_uh.to(sample_log_probs.device) * sample_log_probs_per_sentence)
         log_dict['utility_term'] = utility_term.item()
 
-        # todo average the samples?
-        # utility_term = utility_term/self.num_samples
 
+        if utility_type == "beer":
+            utility_alpha = self.utility_alpha * -1
+        elif utility_type == "edit_distance":
+            utility_alpha = self.utility_alpha
+        batch_loss += utility_term * utility_alpha
 
-        # add to the batch loss
-        batch_loss += utility_term * self.utility_alpha
         # utility_term = utility_term.item()
 
         return batch_loss, log_dict
@@ -136,7 +190,7 @@ class XentLoss(nn.Module):
 
         # pylint: disable=arguments-differ
 
-    def forward(self, log_probs, targets):
+    def forward(self, log_probs, targets, reduce = True):
         """
         Compute the cross-entropy between logits and targets.
 
@@ -158,6 +212,9 @@ class XentLoss(nn.Module):
         else:
             # targets: indices with batch*seq_len
             targets = targets.contiguous().view(-1)
-        loss = self.criterion(
+        if reduce:
+            loss = self.criterion(
             log_probs.contiguous().view(-1, log_probs.size(-1)), targets)
+        else:
+            loss = self.no_reduce_criterion(log_probs.contiguous().view(-1, log_probs.size(-1)), targets)
         return loss

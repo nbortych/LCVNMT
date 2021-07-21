@@ -80,7 +80,7 @@ class Model(nn.Module):
                              "{`loss`, `encode`, `decode`}.")
 
         return_tuple = (None, None, None, None)
-        if return_type == "loss":
+        if return_type == "loss" or return_type == "log_prob":
             assert self.loss_function is not None
             # encode and decode explicitly to save encoded for sampling
             encoder_output, encoder_hidden = self._encode(**kwargs)
@@ -90,8 +90,12 @@ class Model(nn.Module):
 
             # compute log probs
             log_probs = F.log_softmax(out, dim=-1)
+            # logger.info(f"log probs shape {log_probs.shape}")
             # compute batch loss
-            batch_loss = self.loss_function(log_probs, kwargs["trg"])
+            if return_type == "loss":
+                batch_loss = self.loss_function(log_probs, kwargs["trg"])
+            elif return_type == "log_prob":
+                batch_loss = self.loss_function(log_probs, kwargs["trg"], reduce = False)
             utility_reg = kwargs.get("utility_regularising", False)
             if utility_reg:
                 batch_loss, log_dict = self.loss_function.utility_loss(model=self,
@@ -102,7 +106,10 @@ class Model(nn.Module):
                                                                        # (encoder_output, encoder_hidden))
 
             else:
-                log_dict = {"nll": batch_loss.item(), "utility_term": None, "u_h": None}
+                if return_type == "loss":
+                    log_dict = {"nll": batch_loss.item(), "utility_term": None, "u_h": None}
+                else:
+                    log_dict = None
 
             return_tuple = (batch_loss, log_dict)
             # add the encoded batch to output
