@@ -552,7 +552,7 @@ class TrainManager:
             self.tb_writer.add_histogram("train/utilities_histogram", u_h,
                                          self.stats.steps)
             if self.use_wandb:
-                logger.info(f'u_h is {u_h.shape}')
+                # logger.info(f'u_h is {u_h.shape}')
                 log_dict["train/utilities_histogram"] = wandb.Histogram(u_h)
                 # print(f"is u_h in log_dict? {log_dict['train/utilities_histogram']}")
                 wandb.log(log_dict)
@@ -688,7 +688,6 @@ class TrainManager:
                     self.stats.steps += 1
 
                     # log learning progress
-                    # todo log more things here
                     if self.stats.steps % self.logging_freq == 0 or self.small_test_run:
                         if not self.ddp or self.rank == 0:
                             self._log_training(batch_loss, log_dict)
@@ -881,11 +880,12 @@ class TrainManager:
             make_decision = False if track_mbr else True
         logger.info(f"Validating using {valid_type_str}, rank {self.rank}, make_decision {make_decision}")
         valid_start_time = time.time()
+        eval_batch_size = self.eval_batch_size if not track_mbr or self.utility_regularising else self.eval_batch_size // self.test_num_samples
         valid_score, valid_loss, valid_ppl, valid_sources, \
         valid_sources_raw, valid_references, valid_hypotheses, \
         valid_hypotheses_raw, valid_attention_scores, valid_utility, utility_per_sentence, expected_utility_mean = \
             validate_on_data(
-                batch_size=self.eval_batch_size if not track_mbr else self.eval_batch_size // self.test_num_samples,
+                batch_size=eval_batch_size,
                 batch_class=self.batch_class,
                 data=valid_data,
                 eval_metric=self.eval_metric,
@@ -894,7 +894,7 @@ class TrainManager:
                 max_output_length=self.max_output_length,
                 compute_loss=True,
                 beam_size=1,  # greedy validations
-                batch_type=self.eval_batch_type ,
+                batch_type=self.eval_batch_type,
                 postprocess=True,  # always remove BPE for validation
                 bpe_type=self.bpe_type,  # "subword-nmt" or "sentencepiece"
                 sacrebleu=self.sacrebleu,  # sacrebleu options
@@ -907,12 +907,11 @@ class TrainManager:
                 world_size=self.world_size,
                 save_utility_per_sentence=self.save_utility_per_sentence,
                 utility_regularising_loss=self.utility_regularising,
-                precompute_batch = self.precompute_validation
+                precompute_batch=self.precompute_validation
             )
 
         # synchronise+reduce valid scores between the processess
         if self.ddp:
-            # todo normalise loss in predict
             # todo compute bleu + sentence level utility histogram validation
             # utility average
             valid_loss = self._synch_reduce_ddp(valid_loss, reduce_type="mean")
@@ -993,7 +992,7 @@ class TrainManager:
                              utility=valid_utility,
                              mbr=track_mbr)
 
-        if not self.small_test_run:
+        if not self.small_test_run and (not self.ddp or self.rank == 0):
             self._log_examples(sources_raw=[v for v in valid_sources_raw],
                                sources=valid_sources,
                                hypotheses_raw=valid_hypotheses_raw,
