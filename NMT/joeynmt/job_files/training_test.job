@@ -6,7 +6,7 @@
 #SBATCH --job-name=DDP
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --time=00:10:00
+#SBATCH --time=00:20:00
 #SBATCH --mem=32000M
 #SBATCH --output=../slurm/slurm_output_%A_training_test_ddp_gpu.out
 

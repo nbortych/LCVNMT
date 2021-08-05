@@ -105,6 +105,8 @@ class TrainManager:
 
         # generation
         self.max_output_length = train_config.get("max_output_length", None)
+        self.dynamic_max_sample = train_config.get("dynamic_max_sample", False)
+        self.sampling_max_buffer = train_config.get("sampling_max_buffer", 5)
 
         # objective
         self.utility_regularising = train_config.get("utility_regularising", False)
@@ -122,7 +124,9 @@ class TrainManager:
                                             num_samples=self._num_samples,
                                             max_output_length=self.max_output_length,
                                             mean_baseline=self._mean_baseline,
-                                            vimco_baseline=self._vimco_baseline)
+                                            vimco_baseline=self._vimco_baseline,
+                                            dynamic_max_sample=self.dynamic_max_sample,
+                                            sampling_max_buffer=self.sampling_max_buffer)
 
         # thresholding
         self.utility_threshold = train_config.get("regulariser_utility_threshold", 0.0)
@@ -130,7 +134,7 @@ class TrainManager:
         if self.utility_regularising == False:
             self.utility_threshold == 0
 
-        if self.utility_threshold != 0 or self.epoch_threshold!=0:
+        if self.utility_threshold != 0 or self.epoch_threshold != 0:
             self.utility_regularising = False
 
         self.threshold_passed = False
@@ -140,7 +144,13 @@ class TrainManager:
             raise ConfigurationError("Invalid normalization option."
                                      "Valid options: "
                                      "'batch', 'tokens', 'none'.")
+        # MC dropout?
+        self.bnn = train_config.get("bnn", False)
+        self.model.bnn = self.bnn
 
+        if self.bnn:
+            if train_config.get('weight_decay', 0) == 0:
+                train_config['weight_decay'] = 1e-3
         # optimization
         self.learning_rate_min = train_config.get("learning_rate_min", 1.0e-8)
 
@@ -148,7 +158,7 @@ class TrainManager:
         self.optimizer = build_optimizer(config=train_config,
                                          parameters=model.parameters())
 
-        self.ppo_k = train_config.get("ppo_k", 0)
+        self.steps_per_batch = train_config.get("steps_per_batch", 1)
 
         # validation & early stopping
         self.track_mbr = train_config.get("track_mbr", False)
@@ -184,13 +194,13 @@ class TrainManager:
             else:
                 self.minimize_metric = True
         elif self.early_stopping_metric == "utility":
-            if self.utility_type == "beer":
+            if self.utility_type in ["beer", 'bleu', "chrf", "chrf++"]:
                 self.minimize_metric = False
             elif self.utility_type == "editdistance":
                 self.minimize_metric = True
             else:
                 raise ConfigurationError(
-                    f"utility_type must be in one of [beer, editdistance]. It is currently {self.utility_type}")
+                    f"utility_type must be in one of [beer, chrf, chrf++, bleu, editdistance]. It is currently {self.utility_type}")
         else:
             raise ConfigurationError(
                 "Invalid setting for 'early_stopping_metric', "
@@ -211,6 +221,7 @@ class TrainManager:
         self.sample = test_config.get("sample", False)
         self.test_num_samples = test_config.get("num_samples", 10)
         self.precompute_validation = train_config.get("validation_precompute_batch", False)
+        self.checkpoint_epoch = train_config.get("checkpoint_epoch", 0)
         # learning rate scheduling
         self.scheduler, self.scheduler_step_at = build_scheduler(
             config=train_config,
@@ -265,8 +276,12 @@ class TrainManager:
         self.distributed_batch_sampler = train_config.get("distributed_batch_sampler", False)
         self.child_conn = None  # set by child process in case of ddp
         # initialise the utility function
-        if not self.ddp and (self.utility_regularising or self.utility_threshold != 0 or self.epoch_threshold!=0):
-            self.model.loss_function._utility_fn = [get_utility_fn(self.utility_type) for _ in range(mp.cpu_count())]
+        if not self.ddp and (self.utility_regularising or self.utility_threshold != 0 or self.epoch_threshold != 0):
+            if self.utility_type == "beer":
+                self.model.loss_function._utility_fn = [get_utility_fn(self.utility_type) for _ in
+                                                        range(mp.cpu_count())]
+            else:
+                self.model.loss_function._utility_fn = get_utility_fn(self.utility_type)
         # get_utility_fn(self.utility_type)
         # if self.use_cuda:
         #     torch.cuda.empty_cache()
@@ -475,7 +490,7 @@ class TrainManager:
             amp.load_state_dict(model_checkpoint['amp_state'])
 
     def make_small_data(self, data,
-                        small_data_size=40, small_epochs=3, batch_size_dividor=5):
+                        small_data_size=80, small_epochs=3, batch_size_dividor=5):
         logger.info(f"The length of small data is {small_data_size}")
         self.batch_size = small_data_size // batch_size_dividor
         # self.epochs = small_epochs
@@ -514,9 +529,13 @@ class TrainManager:
         # wrap in DDP
         self.model = _DistributedDataParallel(self.model, device_ids=[gpu])
         # init utility_fn
-        if self.utility_regularising or self.utility_threshold != 0 or self.epoch_threshold!=0:
-            self.model.loss_function._utility_fn = [get_utility_fn(self.utility_type) for _ in
-                                                    range(mp.cpu_count() // self.world_size)]
+        if self.utility_regularising or self.utility_threshold != 0 or self.epoch_threshold != 0:
+            if self.utility_type == "beer":
+                self.model.loss_function._utility_fn = get_utility_fn(self.utility_type)
+                # [get_utility_fn(self.utility_type) for _ in
+                #                                   range(mp.cpu_count() // self.world_size)]
+            else:
+                self.model.loss_function._utility_fn = get_utility_fn(self.utility_type)
             self.model.loss_function._world_size = self.world_size
 
         # data handling
@@ -631,7 +650,7 @@ class TrainManager:
         if self.epochs == 0:
             epoch_no = 0
             self._save_checkpoint(True)
-        logger.info(f"Num epochs is {self.epochs}")
+        logger.info(f"Num epochs is {self.epoch_no}/{self.epochs}")
         for epoch_no in range(self.epoch_no, self.epochs):
             logger.info("EPOCH %d", epoch_no + 1)
 
@@ -656,61 +675,77 @@ class TrainManager:
                     self.batch_sampler.set_epoch(self.epoch_no)
                 else:
                     self.train_sampler.set_epoch(self.epoch_no)
-
+            # logger.info("Got to dataloader")
             for i, batch in enumerate(self.dataloader):
+                # logger.info(f"Batch {i}/{len(self.dataloader)}, steps are {self.steps_per_batch}")
+                # logger.info(f"src:{batch[0].shape}, src_len:{batch[1].shape}, trg:{batch[2].shape},trg_len:{batch[3].shape}")
                 # create a Batch object from torch batch
                 batch = self.batch_class(batch, self.model.pad_index,
                                          use_cuda=self.use_cuda, device=self.device)
 
-                # get batch loss
-                batch_loss_iter, log_dict = self._train_step(batch)
-                batch_loss += batch_loss_iter
-                # update!
-                if (i + 1) % self.batch_multiplier == 0:
-                    # clip gradients (in-place)
-                    if self.clip_grad_fun is not None:
-                        if self.fp16:
-                            self.clip_grad_fun(
-                                params=amp.master_params(self.optimizer))
-                        else:
-                            self.clip_grad_fun(params=self.model.parameters())
+                batch_loss_over_k = torch.empty(self.steps_per_batch)
+                # if ppo k is not set, then just do one step
+                samples, log_probs_0 = None, 0
+                for k in range(self.steps_per_batch):
+                    # logger.info(f"Batch {i}/{len(self.dataloader)}, iteration {k}/{self.steps_per_batch}")
+                    batch_loss_iter, log_dict = self._train_step(batch, samples, log_probs_0)
+                    # logger.info(f"src:{batch.src.shape}, trg:{batch.trg.shape}")
 
-                    # make gradient step
-                    self.optimizer.step()
+                    batch_loss += batch_loss_iter
+                    # for next iterations
+                    samples = log_dict['samples_raw']
+                    log_probs_0 = log_dict['log_probs_0']
+                    # logger.info(f"{i}/{self.steps_per_batch}, samples {samples.shape if samples is not None else None}, log_probs {log_probs_0.shape if log_probs_0 != 0 else None}")
+                    # don't actually log
+                    del log_dict['samples_raw']
+                    del log_dict['log_probs_0']
 
-                    # decay lr
-                    if self.scheduler is not None \
-                            and self.scheduler_step_at == "step":
-                        self.scheduler.step()
+                    # update!
+                    if (i + 1) % self.batch_multiplier == 0:
+                        # clip gradients (in-place)
+                        if self.clip_grad_fun is not None:
+                            if self.fp16:
+                                self.clip_grad_fun(
+                                    params=amp.master_params(self.optimizer))
+                            else:
+                                self.clip_grad_fun(params=self.model.parameters())
 
-                    # reset gradients
-                    self.model.zero_grad()
+                        # make gradient step
+                        self.optimizer.step()
 
-                    # increment step counter
-                    self.stats.steps += 1
+                        # decay lr
+                        if self.scheduler is not None \
+                                and self.scheduler_step_at == "step":
+                            self.scheduler.step()
 
-                    # log learning progress
-                    if self.stats.steps % self.logging_freq == 0 or self.small_test_run:
-                        if not self.ddp or self.rank == 0:
-                            self._log_training(batch_loss, log_dict)
-                        elapsed = time.time() - start - total_valid_duration
+                        # reset gradients
+                        self.model.zero_grad()
 
-                        elapsed_tokens = self.stats.total_tokens - start_tokens
-                        logger.info(
-                            f"Epoch {epoch_no + 1}, Step: {self.stats.steps}, Batch Loss: {batch_loss:.6f}, "
-                            f"Tokens per Sec: {elapsed_tokens / elapsed :.0f}, "
-                            f"LR: {self.optimizer.param_groups[0]['lr']:.6f}, rank {0 if self.rank is None else self.rank}"
-                        )
+                        # increment step counter
+                        self.stats.steps += 1
 
-                        epoch_duration += elapsed
+                        # log learning progress
+                        if self.stats.steps % self.logging_freq == 0 or self.small_test_run:
+                            if not self.ddp or self.rank == 0:
+                                self._log_training(batch_loss, log_dict)
+                            elapsed = time.time() - start - total_valid_duration
 
-                        start = time.time()  # if not self.ddp or self.rank == 0 else 0
-                        total_valid_duration = 0
-                        start_tokens = self.stats.total_tokens
+                            elapsed_tokens = self.stats.total_tokens - start_tokens
+                            logger.info(
+                                f"Epoch {epoch_no + 1}, Step: {self.stats.steps}, Batch Loss: {batch_loss:.6f}, "
+                                f"Tokens per Sec: {elapsed_tokens / elapsed :.0f}, "
+                                f"LR: {self.optimizer.param_groups[0]['lr']:.6f}, rank {0 if self.rank is None else self.rank}"
+                            )
 
-                    # Only add complete loss of full mini-batch to epoch_loss
-                    epoch_loss += batch_loss  # accumulate epoch_loss
-                    batch_loss = 0  # rest batch_loss
+                            epoch_duration += elapsed
+
+                            start = time.time()  # if not self.ddp or self.rank == 0 else 0
+                            total_valid_duration = 0
+                            start_tokens = self.stats.total_tokens
+
+                        # Only add complete loss of full mini-batch to epoch_loss
+                        epoch_loss += batch_loss  # accumulate epoch_loss
+                        batch_loss = 0  # rest batch_loss
 
                     # validate on the entire dev set
                     if self.stats.steps % self.validation_freq == 0:
@@ -727,7 +762,7 @@ class TrainManager:
                 # if not self.ddp or self.rank == 0:
                 epoch_duration = time.time() - start - total_valid_duration + epoch_duration
                 # turn on validation and save the precomputed epoch
-                if epoch_no>=self.epoch_threshold and self.epoch_threshold !=0 and not self.threshold_passed:
+                if epoch_no >= self.epoch_threshold and self.epoch_threshold != 0 and not self.threshold_passed:
                     self.utility_regularising = True
                     self.threshold_passed = True
                     self._save_checkpoint(False, pre_calibration=True)
@@ -735,7 +770,10 @@ class TrainManager:
                     f"End of epoch {epoch_no + 1}, it took {epoch_duration:.3f}. Epoch loss is {epoch_loss:.4f}. "
                     f"Rank is {0 if self.rank is None else self.rank}")
 
-            # validate at the end of epoch if small
+            # if safe specific epoch
+            if epoch_no == self.checkpoint_epoch and self.checkpoint_epoch != 0:
+                self._save_checkpoint(False, pre_calibration=True)
+                # validate at the end of epoch if small
             if self.small_test_run:
                 valid_duration = self._validate(valid_data, epoch_no)
                 if self.track_mbr:
@@ -770,7 +808,7 @@ class TrainManager:
             if self.use_wandb:
                 wandb.finish()
 
-    def _train_step(self, batch: Batch) -> (Tensor, dict):
+    def _train_step(self, batch: Batch, samples, log_probs_0) -> (Tensor, dict):
         """
         Train the model on one batch: Compute the loss.
 
@@ -779,52 +817,51 @@ class TrainManager:
         """
         # reactivate training
         self.model.train()
-        batch_loss_over_k = torch.empty(self.ppo_k)
+
         # get loss
-        for i in range(self.ppo_k):
-            batch_loss, log_dict, _, _ = self.model(return_type="loss",
-                                                    **{"batch": batch,
-                                                       "utility_regularising": self.utility_regularising,
-                                                       'utility_type': self.utility_type,
-                                                       **vars(batch)})
+        batch_loss, log_dict, _, _ = self.model(return_type="loss",
+                                                **{"batch": batch,
+                                                   "utility_regularising": self.utility_regularising,
+                                                   'utility_type': self.utility_type,
+                                                   'samples': samples,
+                                                   'log_probs_0': log_probs_0,
+                                                   **vars(batch)})
 
-            # sum multi-gpu losses
-            if self.n_gpu > 1 and not self.ddp:
-                batch_loss = batch_loss.sum()
+        # sum multi-gpu losses
+        if self.n_gpu > 1 and not self.ddp:
+            batch_loss = batch_loss.sum()
 
-            # normalize batch loss
-            if self.normalization == "batch":
-                normalizer = batch.nseqs
-            elif self.normalization == "tokens":
-                normalizer = batch.ntokens
-            elif self.normalization == "none":
-                normalizer = 1
-            else:
-                raise NotImplementedError("Only normalize by 'batch' or 'tokens' "
-                                          "or summation of loss 'none' implemented")
+        # normalize batch loss
+        if self.normalization == "batch":
+            normalizer = batch.nseqs
+        elif self.normalization == "tokens":
+            normalizer = batch.ntokens
+        elif self.normalization == "none":
+            normalizer = 1
+        else:
+            raise NotImplementedError("Only normalize by 'batch' or 'tokens' "
+                                      "or summation of loss 'none' implemented")
 
-            norm_batch_loss = batch_loss / normalizer
+        norm_batch_loss = batch_loss / normalizer
 
-            if self.n_gpu > 1 and not self.ddp:
-                norm_batch_loss = norm_batch_loss / self.n_gpu
+        if self.n_gpu > 1 and not self.ddp:
+            norm_batch_loss = norm_batch_loss / self.n_gpu
 
-            if self.batch_multiplier > 1:
-                norm_batch_loss = norm_batch_loss / self.batch_multiplier
+        if self.batch_multiplier > 1:
+            norm_batch_loss = norm_batch_loss / self.batch_multiplier
 
-            # accumulate gradients
-            if self.fp16:
-                with amp.scale_loss(norm_batch_loss, self.optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                norm_batch_loss.backward()
-            # increment token counter
-            self.stats.total_tokens += batch.ntokens
+        # accumulate gradients
+        if self.fp16:
+            with amp.scale_loss(norm_batch_loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            norm_batch_loss.backward()
+        # increment token counter
+        self.stats.total_tokens += batch.ntokens
 
-            batch_loss_over_k[i]=norm_batch_loss.item()
+        # batch_loss_over_k[i]=norm_batch_loss.item()
 
-
-        norm_batch_loss = batch_loss_over_k
-        #todo what happens with log _dict
+        # todo what happens with log _dict
         return norm_batch_loss.item(), log_dict
 
     def _synch_reduce_ddp(self, score, reduce_type="mean"):
@@ -905,7 +942,7 @@ class TrainManager:
                 batch_type=self.eval_batch_type,
                 postprocess=True,  # always remove BPE for validation
                 bpe_type=self.bpe_type,  # "subword-nmt" or "sentencepiece"
-                sacrebleu=self.sacrebleu,  # sacrebleu options
+                sacrebleu_dict=self.sacrebleu,  # sacrebleu options
                 n_gpu=self.n_gpu,
                 small_test_run=self.small_test_run,
                 mbr=True if track_mbr else False,
@@ -915,7 +952,8 @@ class TrainManager:
                 world_size=self.world_size,
                 save_utility_per_sentence=self.save_utility_per_sentence,
                 utility_regularising_loss=self.utility_regularising,
-                precompute_batch=self.precompute_validation
+                precompute_batch=self.precompute_validation,
+                dynamic_max_output=self.dynamic_max_sample
             )
 
         # synchronise+reduce valid scores between the processess

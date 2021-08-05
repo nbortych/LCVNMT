@@ -377,8 +377,9 @@ def debug_memory():
 
 
 def repeat_batch(batch, num_repeats):
-    batch.src = batch.src.repeat(num_repeats, 1)
-    batch.src_mask = batch.src_mask.repeat(num_repeats, 1, 1)
-    batch.trg_mask = batch.trg_mask.repeat(num_repeats, 1, 1)
-    batch.src_length = batch.src_length.repeat(num_repeats)
-    return batch
+    new_batch = copy.deepcopy(batch)
+    new_batch.src = new_batch.src.repeat(num_repeats, 1)
+    new_batch.src_mask = new_batch.src_mask.repeat(num_repeats, 1, 1)
+    new_batch.trg_mask = new_batch.trg_mask.repeat(num_repeats, 1, 1)
+    new_batch.src_length = new_batch.src_length.repeat(num_repeats)
+    return new_batch

@@ -17,6 +17,8 @@ from multiprocessing.pool import ThreadPool
 from torchtext.legacy.data import Field
 from torch.utils.data import Dataset, Subset
 # from torch.utils.data.distributed import DistributedSampler
+import sacrebleu
+from sacrebleu.metrics import BLEU, CHRF
 
 from joeynmt.helpers import bpe_postprocess, load_config, make_logger, \
     get_latest_checkpoint, load_checkpoint, store_attention_plots, debug_memory, repeat_batch
@@ -35,6 +37,8 @@ except:
 
 logger = logging.getLogger(__name__)
 
+logger.info(f'Sacrebleu version {sacrebleu.__version__}')
+
 
 # pylint: disable=too-many-arguments,too-many-locals,no-member
 def validate_on_data(model: Model, data: Dataset,
@@ -48,7 +52,7 @@ def validate_on_data(model: Model, data: Dataset,
                      batch_type: str = "sentence",
                      postprocess: bool = True,
                      bpe_type: str = "subword-nmt",
-                     sacrebleu: dict = None,
+                     sacrebleu_dict: dict = None,
                      sample: bool = False,
                      mbr: bool = False,
                      mbr_type: str = 'editdistance',
@@ -59,7 +63,8 @@ def validate_on_data(model: Model, data: Dataset,
                      rank=0,
                      world_size=1,
                      utility_regularising_loss=False,
-                     precompute_batch=False) \
+                     precompute_batch=False,
+                     dynamic_max_output=False) \
         -> (float, float, float, List[str], List[List[str]], List[str],
             List[str], List[List[str]], List[np.array]):
     """
@@ -85,7 +90,7 @@ def validate_on_data(model: Model, data: Dataset,
     :param batch_type: validation batch type (sentence or token)
     :param postprocess: if True, remove BPE segmentation from translations
     :param bpe_type: bpe type, one of {"subword-nmt", "sentencepiece"}
-    :param sacrebleu: sacrebleu options
+    :param sacrebleu_dict: sacrebleu_dict options
     :param sample: If True, non-greedy sampling during greedy decoding
     :param mbr:  If True, will use mbr for decoding
 
@@ -101,10 +106,10 @@ def validate_on_data(model: Model, data: Dataset,
         - valid_attention_scores: attention scores for validation hypotheses
     """
     model.ddp = getattr(model, "ddp", False)
-    if not model.ddp:
+    if not model.ddp and isinstance(model, torch.nn.DataParallel):
         assert batch_size >= n_gpu, "batch_size must be bigger than n_gpu."
-    if sacrebleu is None:  # assign default value
-        sacrebleu = {"remove_whitespace": True, "tokenize": "13a"}
+    if sacrebleu_dict is None:  # assign default value
+        sacrebleu_dict = {"remove_whitespace": True, "tokenize": "13a"}
     if batch_size > 1000 and batch_type == "sentence":
         logger.warning(
             "WARNING: Are you sure you meant to work on huge batches like "
@@ -136,14 +141,18 @@ def validate_on_data(model: Model, data: Dataset,
     valid_sources_raw = [src for src, _, trg, _ in data]
     pad_index = model.src_vocab.stoi[PAD_TOKEN]
     # disable dropout
-    model.eval()
+    if not getattr(model, "bnn", False):
+        model.eval()
     # initialise utility function just once
-    if mbr and utility_type == "beer":
-        # logger.info(f"Number of cpu is {mp.cpu_count()} rank {rank}, world size {world_size}")
-        utility_fn = [get_utility_fn(utility_type) for _ in range(mp.cpu_count() // world_size)]
+    if mbr:
+        if utility_type == "beer":
+            # logger.info(f"Number of cpu is {mp.cpu_count()} rank {rank}, world size {world_size}")
+            utility_fn = [get_utility_fn(utility_type) for _ in range(mp.cpu_count() // world_size)]
+        else:
+            utility_fn = get_utility_fn(utility_type)
     else:
         utility_fn = None
-    # don't track gradients during validation
+        # don't track gradients during validation
     with torch.no_grad():
         all_outputs = []
         valid_attention_scores = []
@@ -174,6 +183,8 @@ def validate_on_data(model: Model, data: Dataset,
                 total_ntokens += batch.ntokens
                 total_nseqs += batch.nseqs
 
+            if dynamic_max_output:
+                max_output_length = model.loss_function.dynamic_match_sample_size(batch)
             # run as during inference to produce translations
             if not mbr:
                 output, attention_scores = run_batch(
@@ -243,10 +254,10 @@ def validate_on_data(model: Model, data: Dataset,
                 # this version does not use any tokenization
                 current_valid_score = bleu(
                     valid_hypotheses, valid_references,
-                    tokenize=sacrebleu["tokenize"])
+                    tokenize=sacrebleu_dict["tokenize"])
             elif eval_metric.lower() == 'chrf':
                 current_valid_score = chrf(valid_hypotheses, valid_references,
-                                           remove_whitespace=sacrebleu["remove_whitespace"])
+                                           remove_whitespace=sacrebleu_dict["remove_whitespace"])
             elif eval_metric.lower() == 'token_accuracy':
                 current_valid_score = token_accuracy(  # supply List[List[str]]
                     # todo remove data.trg
@@ -444,7 +455,7 @@ def test(cfg_file,
             max_output_length=max_output_length, eval_metric=eval_metric,
             use_cuda=use_cuda, compute_loss=False, beam_size=beam_size,
             beam_alpha=beam_alpha, postprocess=postprocess,
-            bpe_type=bpe_type, sacrebleu=sacrebleu, n_gpu=n_gpu, sample=sample, mbr=mbr,
+            bpe_type=bpe_type, sacrebleu_dict=sacrebleu, n_gpu=n_gpu, sample=sample, mbr=mbr,
             small_test_run=small_test_run, num_samples=num_samples, mbr_type=mbr_type,
             save_utility_per_sentence=save_utility_per_sentence, utility_type=utility_type)
         # pylint: enable=unused-variable
@@ -531,7 +542,7 @@ def translate(cfg_file: str,
             max_output_length=max_output_length, eval_metric="",
             use_cuda=use_cuda, compute_loss=False, beam_size=beam_size,
             beam_alpha=beam_alpha, postprocess=postprocess,
-            bpe_type=bpe_type, sacrebleu=sacrebleu, n_gpu=n_gpu, sample=sample, mbr=mbr,
+            bpe_type=bpe_type, sacrebleu_dict=sacrebleu, n_gpu=n_gpu, sample=sample, mbr=mbr,
             mbr_type=mbr_type,
             small_test_run=small_test_run, num_samples=num_samples)
         return hypotheses
@@ -620,6 +631,17 @@ def translate(cfg_file: str,
                 break
 
 
+from functools import partial
+
+
+def get_sacre_score_fn(sacre_metric):
+    return partial(sacre_score, sacre_metric=sacre_metric)
+
+
+def sacre_score(hyp, ref, sacre_metric=None):
+    return sacre_metric.sentence_score(hyp, [ref]).score
+
+
 def get_utility_fn(utility_type):
     if utility_type == "editdistance":
         utility_fn = editdistance.eval
@@ -629,6 +651,24 @@ def get_utility_fn(utility_type):
     elif utility_type == "meteor":
         from mbr_nmt.utility import parse_utility
         utility_fn = parse_utility('meteor', lang='en')
+    else:
+        if sacrebleu.__version__ == '2.0.0':
+
+            if utility_type == "bleu":
+                bleu = BLEU(smooth_method='exp',
+                            effective_order=True)
+                utility_fn = lambda hyp, ref: bleu.sentence_score(hyp, [ref]).score
+            elif utility_type in ["chrf", "chrf++"]:
+                word_order = 2 if utility_type == "chrf++" else 0
+                chrf = CHRF(word_order=word_order, )
+                utility_fn = get_sacre_score_fn(chrf)
+        else:
+            if utility_type == "bleu":
+                utility_fn = lambda hyp, ref: sacrebleu.sentence_bleu(hyp, [ref]).score
+            elif utility_type == "chrf":
+                utility_fn = lambda hyp, ref: sacrebleu.sentence_chrf(hyp, [ref]).score
+            elif utility_type == "chrf++":
+                raise Exception("Cannot use chrf++ without sacrebleu of verion 2.0.0")
     return utility_fn
 
 
@@ -650,40 +690,47 @@ def get_utility_of_samples(utility_type, sample_1, sample_2, reduce_type="mean",
     return reduced_utility, total_utility
 
 
+def prepare_encoded_batch_for_sampling(encoded_batch, num_samples):
+    try:
+        encoded_batch[0] = encoded_batch[0].repeat(num_samples, 1, 1)
+    except:
+        pass
+    try:
+        encoded_batch[1] = encoded_batch[1].repeat(num_samples, 1, 1)
+    except:
+        pass
+    return encoded_batch
+
+
 def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="editdistance",
                  utility_type="editdistance", utility_fn=None, return_types=("h",),
                  need_grad=False, compute_log_probs=False, encoded_batch=None, small_test_run=False,
-                 rank=None, world_size=1, samples_raw = None):
+                 rank=None, world_size=1, samples_raw=None):
     set_of_possible_returns = {"h", "samples", "samples_raw", "utilities", "log_probabilities",
-                               "mean_batch_expected_uility_h"}
+                               "mean_batch_expected_uility_h", "batch"}
     assert len(set(return_types) - set_of_possible_returns) == 0, f"You have specified wrong return types. " \
-                                                                  f"Make sure it's one (or more) out of {set_of_possible_returns}"
+                                                                  f"Make sure it's one (or more) out of" \
+                                                                  f" {set_of_possible_returns}"
     # sample S samples of translation y|x  using  run_batch
 
-    # copy batch num_samples times to sample
+    # repeat along batch dimension num_samples times to simulate sampling
     batch_size = batch.src.shape[0]
-
-
+    batch = repeat_batch(batch, num_samples)
     if samples_raw is None:
-        # be careful! the batch is modified
-        batch = repeat_batch(batch, num_samples)
         if encoded_batch is not None and encoded_batch[0] is not None:
-            try:
-                encoded_batch[0] = encoded_batch[0].repeat(num_samples, 1, 1)
-            except:
-                pass
-            try:
-                encoded_batch[1] = encoded_batch[1].repeat(num_samples, 1, 1)
-            except:
-                pass
+            encoded_batch = prepare_encoded_batch_for_sampling(encoded_batch, num_samples)
         else:
             encoded_batch = None
         # [B*SxL, B*S]
-        samples_raw, log_probs = run_batch(model, batch, max_output_length=max_output_length, beam_size=1, beam_alpha=1,
+        samples_raw, log_probs = run_batch(model, batch, max_output_length=max_output_length, beam_size=1,
+                                           beam_alpha=1,
                                            sample=True, need_grad=need_grad, compute_log_probs=compute_log_probs,
                                            encoded_batch=encoded_batch)
     else:
-        assert samples_raw[0].shape == batch_size*num_samples, "Something is wrong with sample shape"
+        assert samples_raw.shape[0] == batch_size * num_samples, \
+            f"Something is wrong with sample shape, it must be [B*S, L]," \
+            f" it is currently [{samples_raw.shape[0]}, {samples_raw.shape[1]}]," \
+            f" while B is {batch_size} and S is {num_samples}"
         log_probs = None
         # if rank is not None:
     # logger.info(f"got samples rank {rank}")
@@ -698,10 +745,12 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
         # define utility function
         if utility_fn is None:
             utility_fn = get_utility_fn(utility_type)
-        # transform indices to str [BxS]
-        decoded_samples = [
-            [' '.join(sample) for sample in model.trg_vocab.arrays_to_sentences(arrays=batch,
-                                                                                cut_at_eos=True)] for batch in samples]
+
+        # transform indices to str [BxS] if len(sample)!=0 else "the"
+        decoded_samples = [[bpe_postprocess(' '.join(sample) + '<\s>')  for sample in
+                            model.trg_vocab.arrays_to_sentences(arrays=batch, cut_at_eos=True)] for batch in samples]
+
+
         # initialise utility matrix [BxSxS]
         # if symmetrical utility, do this
         if utility_type == "editdistance":
@@ -726,29 +775,54 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
 
             # # computing utility of the samples [Bx(S^2)]
             # [B*S^2]
-            if type(utility_fn) != list:
-                utilities = torch.tensor([list(itertools.starmap(utility_fn, combinations_of_samples)) for
-                                          combinations_of_samples in batch_combinations_of_samples], dtype=torch.float)
+            # multiprocessing sacre utilities
+            if False and utility_type != "beer":
+                chunked_batches_and_utility_fns = [(chunked_batches[i], utility_fn[i]) for i in
+                                                   range(len(chunked_batches))]
+                with mp.Pool(cpus) as p:
+                    utilities = p.map(eval_utility_chunked_batch, chunked_batches_and_utility_fns)
+                utilities = torch.tensor([u for sublist in utilities for u in sublist], dtype=torch.float)
+
+            elif type(utility_fn) != list:
+                try:
+                    utilities = torch.tensor([list(itertools.starmap(utility_fn, combinations_of_samples)) for
+                                          combinations_of_samples in batch_combinations_of_samples],
+                                         dtype=torch.float)
+                # utilities = []
+                # for combinations_of_samples in batch_combinations_of_samples:
+                #     for combination in combinations_of_samples:
+                #         try:
+                #             utilities.append(utility_fn(*combination))
+                #         except:
+                #             logger.info(f"Combination is {combination}")
+                #             utilities.append(0)
+                #
+                # utilities = torch.tensor([list(itertools.starmap(utility_fn, combinations_of_samples)) ],
+                #                          dtype=torch.float)
+                except:
+                    logger.info(f"Fucked up")
+                    # for batch in decoded_samples:
+                    #     for sample in decoded_samples:
+                    #         if len(sample)<=2:
+                    #             logger.info(f"The wrong sample {sample}")
+                    utilities = torch.ones((batch_size, num_samples, num_samples), dtype=torch.float)
+            # multithreading
             elif type(utility_fn) == list:
                 # number of threads is number of cpus per gpu
                 cpus = mp.cpu_count() // world_size
                 # number of examples per thread
-                num_per_thread = int(np.ceil(len(batch_combinations_of_samples) / cpus))
+                num_per_cpu = int(np.ceil(len(batch_combinations_of_samples) / cpus))
                 # chunk the batch for each thread and combine with specififc utility process
-                chunked_batches = [batch_combinations_of_samples[i:i + num_per_thread]
-                                   for i in range(0, len(batch_combinations_of_samples), num_per_thread)]
-                # logger.info(
-                #     f"Chunki batch len {len(chunked_batches)}, "
-                #     f"Combi batch len {len(batch_combinations_of_samples)}, "
-                #     f"Utility_fn len {len(utility_fn)},"
-                #     f"Cpus {cpus}, "
-                #     f" num per thread {num_per_thread}")
+                chunked_batches = [batch_combinations_of_samples[i:i + num_per_cpu]
+                                   for i in range(0, len(batch_combinations_of_samples), num_per_cpu)]
+
+                # add the utility fn next to the batches
                 chunked_batches_and_utility_fns = [(chunked_batches[i], utility_fn[i]) for i in
                                                    range(len(chunked_batches))]
 
                 # multithread
                 with ThreadPool(cpus) as p:
-                    utilities = p.map(eval_utility_batches_threads, chunked_batches_and_utility_fns)
+                    utilities = p.map(eval_utility_chunked_batch, chunked_batches_and_utility_fns)
                 # flatten the list and wrap in a tensor
                 utilities = torch.tensor([u for sublist in utilities for u in sublist], dtype=torch.float)
 
@@ -782,6 +856,8 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
             return_dict['utilities'] = u_h
         if "log_probabilities" in return_types:
             return_dict['log_probabilities'] = log_probs
+        if "batch" in return_types:
+            return_dict['batch'] = batch
         if "mean_batch_expected_uility_h" in return_types:
             # logger.info(f"best_idx {best_idx} expected_utility shape {expected_uility.shape}")
             return_dict['mean_batch_expected_uility_h'] = torch.mean(expected_uility[:, best_idx].detach())
@@ -824,6 +900,7 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
 #     utility =  utility_fn(*args)
 #     utility_fn.proc.kill()
 #     return utility
+
 # calling the call_batch function
 # def batch_call_utility_fn(batch_combinations_of_samples, utility_fn):
 #     hyp_ref_batches = [zip(*batch) for batch in batch_combinations_of_samples]
@@ -835,14 +912,15 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
 #     utilities = torch.tensor([utility_fn.call_batch(hyp_batch, ref_batch)], dtype=torch.float)
 
 # eval utility of a single batch
-# def eval_utility_batch(batch):
-#     utility_fn = get_utility_fn("beer")
-#     utility = [utility_fn(*combination_of_samples) for combination_of_samples in batch]
-#     return utility
+def eval_utility_batch(batch, utility_fn):
+    utility = [utility_fn(*combination_of_samples) for combination_of_samples in batch]
+    return utility
 
 
-def eval_utility_batches_threads(batches_and_fn):
+def eval_utility_chunked_batch(batches_and_fn):
     batches, utility_fn = batches_and_fn
+    print(len(batches), flush=True)
+
     utility = [list(itertools.starmap(utility_fn, combinations_of_samples)) for
                combinations_of_samples in batches]
     return utility
@@ -858,14 +936,6 @@ def eval_utility_batches_threads(batches_and_fn):
 #                combinations_of_samples in batches]
 #     # utility = [utility_fn(*combination_of_samples) for combination_of_samples in batch]
 #     return utility
-
-#
-# class Beer_multiprocess():
-#     def __init__(self, num_threads):
-#         self.processes = [get_utility_fn("beer") for _ in range(num_threads)]
-#
-#     def call_batches(self, *args, **kwargs):
-#         pass
 
 
 if __name__ == "__main__":

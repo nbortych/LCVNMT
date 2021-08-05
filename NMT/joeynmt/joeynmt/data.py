@@ -18,6 +18,7 @@ from torchtext.legacy.datasets import TranslationDataset
 from torchtext.legacy import data
 # from torchtext.legacy.data import Dataset, Iterator, Field
 from torch.nn.utils.rnn import pad_sequence
+import numpy as np
 
 from joeynmt.constants import UNK_TOKEN, EOS_TOKEN, BOS_TOKEN, PAD_TOKEN
 from joeynmt.vocabulary import build_vocab, Vocabulary
@@ -222,6 +223,7 @@ class TranslationTextDataset(Dataset):
         #         self.vocab['<EOS>']]
 
         self.data = []
+        self.trg_length = []
         # load the files into a list
         with io.open(src_path, mode='r', encoding='utf-8') as src_file, \
                 io.open(trg_path, mode='r', encoding='utf-8') as trg_file:
@@ -238,9 +240,13 @@ class TranslationTextDataset(Dataset):
                     # make sure we don't append too big of examples
                     if src_len <= max_sent_length and trg_len <= max_sent_length:
                         self.data.append((src_line, src_len, trg_line, trg_len))
+                        self.trg_length.append(trg_len)
+
                     # if vocab is not None:
                     #     self.data.append((vocab_transform(src_line), vocab_transform(trg_line)))
+        percentiles = np.array([0.9,0.91,0.92,0.93,0.94,0.95,0.96,0.97,0.98,0.99,1])*100
 
+        logger.info(f"Data percentiles are {percentiles} and the target length for these percentiles are {np.percentile(self.trg_length, percentiles)}")
         self.len_data = len(self.data)
         self.description = description
 

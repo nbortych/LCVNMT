@@ -95,24 +95,31 @@ class Model(nn.Module):
             if return_type == "loss":
                 batch_loss = self.loss_function(log_probs, kwargs["trg"])
             elif return_type == "log_prob":
-                batch_loss = self.loss_function(log_probs, kwargs["trg"], reduce = False)
+                batch_loss = self.loss_function(log_probs, kwargs["trg"], reduce=False)
             utility_reg = kwargs.get("utility_regularising", False)
             if utility_reg:
                 batch_loss, log_dict = self.loss_function.utility_loss(model=self,
                                                                        batch=kwargs['batch'],
                                                                        batch_loss=batch_loss,
                                                                        utility_type=kwargs['utility_type'],
-                                                                       encoded_batch = None)
-                                                                       # (encoder_output, encoder_hidden))
+                                                                       encoded_batch=None,
+                                                                       samples_raw=kwargs.get('samples', None),
+                                                                       log_probs_0=kwargs.get('log_probs_0', 0))
+                # (encoder_output, encoder_hidden))
 
             else:
                 if return_type == "loss":
-                    log_dict = {"nll": batch_loss.item(), "utility_term": None, "u_h": None}
+                    log_dict = {"nll": batch_loss.item(), "utility_term": None, "u_h": None, 'samples_raw': None,
+                                "log_probs_0": 0}
                 else:
                     log_dict = None
 
             return_tuple = (batch_loss, log_dict)
             # add the encoded batch to output
+            # if kwargs.get("return_encoded", False):
+            #     return_tuple += (log_dict.get('samples_raw', None), log_dict.get("log_probs_0", 0))
+
+            # elif kwargs.get("k", 0) != 0 and utility_reg \
             if kwargs.get("return_encoded", False):
                 return_tuple += (encoder_output, encoder_hidden)
             else:

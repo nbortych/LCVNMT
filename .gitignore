@@ -14,6 +14,9 @@ NMT/joeynmt/beer_2.0
 LCDA/.idea
 NMT/.idea
 
+#sacreblue-2.0.0
+NMT/sacrebleu-master
+
 *.egg-info/*
 .idea/*
 build/*
