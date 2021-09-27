@@ -20,6 +20,7 @@ from torch.utils.data import Dataset, Subset
 import sacrebleu
 from sacrebleu.metrics import BLEU, CHRF
 
+import wandb
 from joeynmt.helpers import bpe_postprocess, load_config, make_logger, \
     get_latest_checkpoint, load_checkpoint, store_attention_plots, debug_memory, repeat_batch
 from joeynmt.metrics import bleu, chrf, token_accuracy, sequence_accuracy
@@ -64,7 +65,8 @@ def validate_on_data(model: Model, data: Dataset,
                      world_size=1,
                      utility_regularising_loss=False,
                      precompute_batch=False,
-                     dynamic_max_output=False) \
+                     dynamic_max_output=False,
+                     multi_utility=False) \
         -> (float, float, float, List[str], List[List[str]], List[str],
             List[str], List[List[str]], List[np.array]):
     """
@@ -268,10 +270,22 @@ def validate_on_data(model: Model, data: Dataset,
             else:
                 current_valid_score = -1
             # compute utility
-            if utility_type is not None:
+            if utility_type is not None and not multi_utility:
                 reduced_utility, utility_per_sentence = get_utility_of_samples(utility_type, valid_hypotheses,
                                                                                valid_references, reduce_type="mean",
                                                                                save_utility_per_sentence=save_utility_per_sentence)
+            elif multi_utility:
+                reduced_utility, utility_per_sentence = [], []
+                for utility in ["beer", "chrf", "bleu"]:
+                    reduced, per_sentence = get_utility_of_samples(utility, valid_hypotheses,
+                                                                   valid_references, reduce_type="mean",
+                                                                   save_utility_per_sentence=save_utility_per_sentence)
+                    reduced_utility.append(reduced)
+                    utility_per_sentence.append(per_sentence)
+
+            else:
+                reduced_utility = 0
+                utility_per_sentence = None
         else:
             current_valid_score = -1
             reduced_utility = 0
@@ -343,6 +357,11 @@ def parse_test_args(cfg, mode="test"):
         mbr_type = cfg["testing"].get("mbr_type", 'editdistance')
         utility_type = cfg["testing"].get("utility", 'editdistance')
         save_utility_per_sentence = cfg["testing"].get("save_utility_per_sentence", False)
+        all_decoding_types = cfg["testing"].get("all_decoding_types", False)
+        multi_utility = cfg["testing"].get("multi_utility", False)
+        multi_mbr = cfg["testing"].get("multi_mbr", False)
+        only_test = cfg["testing"].get("only_test", False)
+
 
     else:
         beam_size = 1
@@ -357,6 +376,10 @@ def parse_test_args(cfg, mode="test"):
         mbr_type = 'editdistance'
         utility_type = None
         save_utility_per_sentence = False
+        all_decoding_types = False
+        multi_utility = False
+        multi_mbr = False
+        only_test = False
 
     mbr_text, empty = f"{mbr_type}_MBR_", ""
     decoding_description = f"{'Greedy decoding' if (not sample and not mbr) else f'{mbr_text if mbr else empty}Sample decoding'}" if beam_size < 2 else \
@@ -370,7 +393,8 @@ def parse_test_args(cfg, mode="test"):
            eval_metric, max_output_length, beam_size, beam_alpha, \
            postprocess, bpe_type, sacrebleu, decoding_description, \
            tokenizer_info, sample, mbr, mbr_type, small_test_run, \
-           num_samples, utility_type, save_utility_per_sentence
+           num_samples, utility_type, save_utility_per_sentence, \
+           all_decoding_types, multi_utility, multi_mbr, only_test
 
 
 # pylint: disable-msg=logging-too-many-args
@@ -395,34 +419,44 @@ def test(cfg_file,
     test_start_time = time.time()
     cfg = load_config(cfg_file)
     model_dir = cfg["training"]["model_dir"]
+    from joeynmt.training import init_wandb
+    init_wandb(cfg)
 
     if len(logger.handlers) == 0:
         _ = make_logger(model_dir, mode="test")  # version string returned
 
     # when checkpoint is not specified, take latest (best) from model dir
     if ckpt is None:
-        ckpt = get_latest_checkpoint(model_dir)
+        ckpt = f"{model_dir}/best.ckpt"
+        if not os.path.exists(ckpt):
+            ckpt = get_latest_checkpoint(model_dir)
         try:
             step = ckpt.split(model_dir + "/")[1].split(".ckpt")[0]
         except IndexError:
             step = "best"
+    logger.info(f"Loading checkpoint {step}")
+    # parse test args
+    batch_size, batch_type, use_cuda, device, n_gpu, level, eval_metric, \
+    max_output_length, beam_size, beam_alpha, postprocess, \
+    bpe_type, sacrebleu, decoding_description, tokenizer_info, \
+    sample, mbr, mbr_type, small_test_run, num_samples, utility_type, \
+    save_utility_per_sentence, all_decoding_types, multi_utility, multi_mbr, \
+    only_test = parse_test_args(cfg, mode="test")
 
     # load the data
     if datasets is None:
         _, dev_data, test_data, src_vocab, trg_vocab = load_data(
             data_cfg=cfg["data"], datasets=["dev", "test"])
-        data_to_predict = {"dev": dev_data, "test": test_data}
+        data_to_predict = {"test": test_data}
+        if not only_test:
+            data_to_predict["dev"] = dev_data
     else:  # avoid to load data again
-        data_to_predict = {"dev": datasets["dev"], "test": datasets["test"]}
+        data_to_predict = {"test": datasets["test"]}
+        if not only_test:
+            data_to_predict["dev"] = datasets["dev"]
         src_vocab = datasets["src_vocab"]
         trg_vocab = datasets["trg_vocab"]
 
-    # parse test args
-    batch_size, batch_type, use_cuda, device, n_gpu, level, eval_metric, \
-    max_output_length, beam_size, beam_alpha, postprocess, \
-    bpe_type, sacrebleu, decoding_description, tokenizer_info, \
-    sample, mbr, mbr_type, small_test_run, num_samples, utility_type, save_utility_per_sentence \
-        = parse_test_args(cfg, mode="test")
     # load model state from disk
     model_checkpoint = load_checkpoint(ckpt, use_cuda=use_cuda)
 
@@ -433,6 +467,14 @@ def test(cfg_file,
 
     if use_cuda:
         model.to(device)
+
+    if all_decoding_types:
+        decoding_types = ["beam", "greedy", "mbr"]
+    elif multi_mbr:
+        decoding_types = ["mbr_80"]#["mbr_10", "mbr_20", "mbr_40", "mbr_80"]
+    else:
+        decoding_types = [None]
+
 
     # multi-gpu eval
     # todo fix multigpu (DDP has problems with returning dict + if data is not devisable by n_gpu)
@@ -446,51 +488,90 @@ def test(cfg_file,
 
         dataset_file = cfg["data"][data_set_name] + "." + cfg["data"]["trg"]
         logger.info("Decoding on %s set (%s)...", data_set_name, dataset_file)
-
-        # pylint: disable=unused-variable
-        score, loss, ppl, sources, sources_raw, references, hypotheses, \
-        hypotheses_raw, attention_scores, utility, utility_per_sentence, expected_utility_mean = validate_on_data(
-            model, data=data_set, batch_size=batch_size,
-            batch_class=batch_class, batch_type=batch_type, level=level,
-            max_output_length=max_output_length, eval_metric=eval_metric,
-            use_cuda=use_cuda, compute_loss=False, beam_size=beam_size,
-            beam_alpha=beam_alpha, postprocess=postprocess,
-            bpe_type=bpe_type, sacrebleu_dict=sacrebleu, n_gpu=n_gpu, sample=sample, mbr=mbr,
-            small_test_run=small_test_run, num_samples=num_samples, mbr_type=mbr_type,
-            save_utility_per_sentence=save_utility_per_sentence, utility_type=utility_type)
-        # pylint: enable=unused-variable
-
-        # if "trg" in data_set.fields:
-        logger.info("%4s %s%s: %6.2f [%s]",
-                    data_set_name, eval_metric, tokenizer_info,
-                    score, decoding_description)
-        # else:
-        #     logger.info("No references given for %s -> no evaluation.",
-        #                 data_set_name)
-
-        if save_attention:
-            if attention_scores:
-                attention_name = "{}.{}.att".format(data_set_name, step)
-                attention_path = os.path.join(model_dir, attention_name)
-                logger.info("Saving attention plots. This might take a while..")
-                store_attention_plots(attentions=attention_scores,
-                                      targets=hypotheses_raw,
-                                      sources=data_set.src,
-                                      indices=range(len(hypotheses)),
-                                      output_prefix=attention_path)
-                logger.info("Attention plots saved to: %s", attention_path)
+        for decoding_type in decoding_types:
+            if decoding_type == None:
+                pass
             else:
-                logger.warning("Attention scores could not be saved. "
-                               "Note that attention scores are not available "
-                               "when using beam search. "
-                               "Set beam_size to 1 for greedy decoding.")
+                logger.info(f"Decoding using {decoding_type} decoding.")
+                if decoding_type == "beam":
+                    beam_size = 5
+                    mbr = False
+                elif decoding_type == "greedy":
+                    beam_size = 1
+                    mbr = False
+                elif decoding_type == "mbr":
+                    beam_size = 1
+                    mbr = True
+                elif decoding_type.split("_")[0] == "mbr":
+                    beam_size = 1
+                    mbr = True
+                    num_samples = int(decoding_type.split("_")[1])
 
-        if output_path is not None:
-            output_path_set = "{}.{}".format(output_path, data_set_name)
-            with open(output_path_set, mode="w", encoding="utf-8") as out_file:
-                for hyp in hypotheses:
-                    out_file.write(hyp + "\n")
-            logger.info("Translations saved to: %s", output_path_set)
+            # pylint: disable=unused-variable
+            score, loss, ppl, sources, sources_raw, references, hypotheses, \
+            hypotheses_raw, attention_scores, utility, utility_per_sentence, expected_utility_mean = validate_on_data(
+                model, data=data_set, batch_size=batch_size,
+                batch_class=batch_class, batch_type=batch_type, level=level,
+                max_output_length=max_output_length, eval_metric=eval_metric,
+                use_cuda=use_cuda, compute_loss=False, beam_size=beam_size,  # 5 beam_size
+                beam_alpha=beam_alpha, postprocess=postprocess,
+                bpe_type=bpe_type, sacrebleu_dict=sacrebleu, n_gpu=n_gpu, sample=sample, mbr=mbr,  # mbr
+                small_test_run=small_test_run, num_samples=num_samples, mbr_type=mbr_type,
+                save_utility_per_sentence=save_utility_per_sentence, utility_type=utility_type,
+                multi_utility=multi_utility)
+            # pylint: enable=unused-variable
+
+            # if "trg" in data_set.fields:
+            logger.info("%4s %s%s: %6.2f [%s]",
+                        data_set_name, eval_metric, tokenizer_info,
+                        score, decoding_description)
+
+            log_names, log_values = ["score", 'loss', "ppl", "expected_utility_mean"], [score, loss, ppl,
+                                                                                        expected_utility_mean]
+
+            if not multi_utility:
+                log_names.extend([f"utility_{utility_type}", "utility_per_sentence"])
+                log_values.extend([utility, wandb.Histogram(utility_per_sentence)])
+            else:
+                log_names.extend(["utility_beer", "utility_chrf", "utility_bleu", "utility_per_sentence_beer",
+                                  "utility_per_sentence_chrf", "utility_per_sentence_bleu"])
+                log_values.extend(utility)
+                histograms = list(map(wandb.Histogram, utility_per_sentence))
+                log_values.extend(histograms)
+
+            log_dict = {f"test/{decoding_type if decoding_type is not None else 'mbr'}/{step if step == 'best' else 'converged'}/{key}": value for key, value
+                        in
+                        zip(log_names, log_values)}
+
+            wandb.log(log_dict)
+
+            # else:
+            #     logger.info("No references given for %s -> no evaluation.",
+            #                 data_set_name)
+
+            if save_attention:
+                if attention_scores:
+                    attention_name = "{}.{}.att".format(data_set_name, step)
+                    attention_path = os.path.join(model_dir, attention_name)
+                    logger.info("Saving attention plots. This might take a while..")
+                    store_attention_plots(attentions=attention_scores,
+                                          targets=hypotheses_raw,
+                                          sources=data_set.src,
+                                          indices=range(len(hypotheses)),
+                                          output_prefix=attention_path)
+                    logger.info("Attention plots saved to: %s", attention_path)
+                else:
+                    logger.warning("Attention scores could not be saved. "
+                                   "Note that attention scores are not available "
+                                   "when using beam search. "
+                                   "Set beam_size to 1 for greedy decoding.")
+
+            if output_path is not None:
+                output_path_set = "{}.{}".format(output_path, data_set_name)
+                with open(output_path_set, mode="w", encoding="utf-8") as out_file:
+                    for hyp in hypotheses:
+                        out_file.write(hyp + "\n")
+                logger.info("Translations saved to: %s", output_path_set)
         test_duration = time.time() - test_start_time
         logger.info(f"Test duration was {test_duration:.2f}")
 
@@ -580,7 +661,7 @@ def translate(cfg_file: str,
     batch_size, batch_type, use_cuda, device, n_gpu, level, _, \
     max_output_length, beam_size, beam_alpha, postprocess, \
     bpe_type, sacrebleu, _, _, sample, mbr, mbr_type, small_test_run, \
-    num_samples, utility_type, save_utility_per_sentence = parse_test_args(cfg, mode="translate")
+    num_samples, utility_type, save_utility_per_sentence, _, _, _, _ = parse_test_args(cfg, mode="translate")
 
     # load model state from disk
     model_checkpoint = load_checkpoint(ckpt, use_cuda=use_cuda)
@@ -657,11 +738,12 @@ def get_utility_fn(utility_type):
             if utility_type == "bleu":
                 bleu = BLEU(smooth_method='exp',
                             effective_order=True)
-                utility_fn = lambda hyp, ref: bleu.sentence_score(hyp, [ref]).score
+                utility_fn = get_sacre_score_fn(bleu)  # lambda hyp, ref: bleu.sentence_score(hyp, [ref]).score
             elif utility_type in ["chrf", "chrf++"]:
                 word_order = 2 if utility_type == "chrf++" else 0
                 chrf = CHRF(word_order=word_order, )
                 utility_fn = get_sacre_score_fn(chrf)
+
         else:
             if utility_type == "bleu":
                 utility_fn = lambda hyp, ref: sacrebleu.sentence_bleu(hyp, [ref]).score
@@ -747,9 +829,8 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
             utility_fn = get_utility_fn(utility_type)
 
         # transform indices to str [BxS] if len(sample)!=0 else "the"
-        decoded_samples = [[bpe_postprocess(' '.join(sample) + '<\s>')  for sample in
+        decoded_samples = [[bpe_postprocess(' '.join(sample) + '<\s>') for sample in
                             model.trg_vocab.arrays_to_sentences(arrays=batch, cut_at_eos=True)] for batch in samples]
-
 
         # initialise utility matrix [BxSxS]
         # if symmetrical utility, do this
@@ -784,28 +865,10 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
                 utilities = torch.tensor([u for sublist in utilities for u in sublist], dtype=torch.float)
 
             elif type(utility_fn) != list:
-                try:
-                    utilities = torch.tensor([list(itertools.starmap(utility_fn, combinations_of_samples)) for
+
+                utilities = torch.tensor([list(itertools.starmap(utility_fn, combinations_of_samples)) for
                                           combinations_of_samples in batch_combinations_of_samples],
                                          dtype=torch.float)
-                # utilities = []
-                # for combinations_of_samples in batch_combinations_of_samples:
-                #     for combination in combinations_of_samples:
-                #         try:
-                #             utilities.append(utility_fn(*combination))
-                #         except:
-                #             logger.info(f"Combination is {combination}")
-                #             utilities.append(0)
-                #
-                # utilities = torch.tensor([list(itertools.starmap(utility_fn, combinations_of_samples)) ],
-                #                          dtype=torch.float)
-                except:
-                    logger.info(f"Fucked up")
-                    # for batch in decoded_samples:
-                    #     for sample in decoded_samples:
-                    #         if len(sample)<=2:
-                    #             logger.info(f"The wrong sample {sample}")
-                    utilities = torch.ones((batch_size, num_samples, num_samples), dtype=torch.float)
             # multithreading
             elif type(utility_fn) == list:
                 # number of threads is number of cpus per gpu

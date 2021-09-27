@@ -107,8 +107,9 @@ def load_data(data_cfg: dict, datasets: list = None) \
                             max_size=trg_max_size,
                             dataset=train_data, vocab_file=trg_vocab_file,
                             pickle_file=trg_vocab_pickle)
-    train_data.src_vocab = src_vocab
-    train_data.trg_vocab = trg_vocab
+    if train_data is not None:
+        train_data.src_vocab = src_vocab
+        train_data.trg_vocab = trg_vocab
 
     dev_data = None
     if "dev" in datasets and dev_path is not None:

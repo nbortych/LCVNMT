@@ -25,17 +25,19 @@ testing:
     utility: "chrf"
     num_samples: 10
     save_utility_per_sentence: True
-    all_decoding_types: True
+    all_decoding_types: False
     multi_utility: True
     only_test: True
+    multi_mbr: True
+
 training:
-#    load_model: "models/iwslt14_deen_bpe_transformer_baseline_0_cp/211000.ckpt"
+#    load_model: "models/iwslt14_deen_bpe_transformer_bnn_3_lr0/best.ckpt"
     random_seed: 42
     optimizer: "adam"
     normalization: "tokens"
     adam_betas: [0.9, 0.999]
     scheduling: "plateau"
-    patience: 6
+    patience: 10
     decrease_factor: 0.7
     loss: "crossentropy"
     learning_rate: 0.0003
@@ -43,24 +45,23 @@ training:
     weight_decay: 0.0001
     label_smoothing: 0
     batch_size: 128
-    eval_batch_size: 10
+    eval_batch_size: 1 #0
     batch_type: "sentence"
     early_stopping_metric: "utility"
-    epochs: 21
-    validation_freq: 1000
+    epochs: 100
+    validation_freq: 500
     logging_freq: 100
     eval_metric: ''
-#    model_dir: "models/iwslt14_deen_bpe_transformer_precalibration_1"
-    model_dir: "models/iwslt14_deen_bpe_transformer_baseline_5"
+    model_dir: "models/iwslt14_deen_bpe_transformer_bnn_3_lr0"
     overwrite: False
     shuffle: True
     use_cuda: True
-    max_output_length: 62 #50
+    max_output_length: 50 #50
     dynamic_max_sample: True
     sampling_max_buffer: 5
     print_valid_sents: [0, 1, 2, 3, 4]
     keep_last_ckpts: 5
-    checkpoint_epoch: 20
+    checkpoint_epoch: 200
     # LC-NMT specific things
     track_mbr: True
     mbr_type: "editdistance"
@@ -75,10 +76,11 @@ training:
     mean_baseline: True
     vimco_baseline: True
     wandb: True
-    early_stopping: True
-    validation_stopping: True
+    early_stopping: False
+    validation_stopping: False
     early_stopping_patience: 18
     validation_precompute_batch: True
+    bnn: True
 
 
 
@@ -97,7 +99,7 @@ model:
         embeddings:
             embedding_dim: 256
             scale: True
-            dropout: 0.
+            dropout: 0.3
         # typically ff_size = 4 x hidden_size
         hidden_size: 256
         ff_size: 1024
@@ -109,7 +111,7 @@ model:
         embeddings:
             embedding_dim: 256
             scale: True
-            dropout: 0.
+            dropout: 0.3
         # typically ff_size = 4 x hidden_size
         hidden_size: 256
         ff_size: 1024

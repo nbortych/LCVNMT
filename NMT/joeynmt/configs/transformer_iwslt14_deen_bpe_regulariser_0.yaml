@@ -22,15 +22,16 @@ testing:
     small_test_run: False
     mbr: True
     mbr_type: "editdistance"
-    utility: "beer"
+    utility: "chrf"
     num_samples: 10
     save_utility_per_sentence: True
 
 training:
-    load_model: "models/iwslt14_deen_bpe_transformer_baseline_2/precalibrated.ckpt"
-    reset_best_ckpt: True
-    reset_scheduler: True
-    reset_optimizer: True
+#    load_model: "models/iwslt14_deen_bpe_transformer_precalibration_1/best.ckpt"
+#    load_model: "models/iwslt14_deen_bpe_transformer_regulariser_4_lr0/latest.ckpt"
+#    reset_best_ckpt: True
+#    reset_scheduler: True
+#    reset_optimizer: True
     random_seed: 42
     optimizer: "adam"
     normalization: "tokens"
@@ -49,14 +50,14 @@ training:
     batch_type: "sentence"
     early_stopping_metric: "utility"
     epochs: 2
-    validation_freq: 1000
-    logging_freq: 100
+    validation_freq: 10000
+    logging_freq: 500
     eval_metric: ''
-    model_dir: "models/iwslt14_deen_bpe_transformer_regulariser_2_lr0"
+    model_dir: "models/iwslt14_deen_bpe_transformer_regulariser_4_lr0_cp"
     overwrite: True
     shuffle: True
     use_cuda: True
-    max_output_length: 50 #50
+    max_output_length: 62 #50
     dynamic_max_sample: True
     sampling_max_buffer: 5
     print_valid_sents: [0, 1, 2, 3, 4]
@@ -65,7 +66,7 @@ training:
     track_mbr: True
     mbr_type: "editdistance"
     utility: "chrf"
-    small_test_run: True
+    small_test_run: False
     utility_regularising: True
     utility_alpha: 1
     num_samples: 10

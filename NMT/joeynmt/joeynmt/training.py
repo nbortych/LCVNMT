@@ -128,6 +128,8 @@ class TrainManager:
                                             dynamic_max_sample=self.dynamic_max_sample,
                                             sampling_max_buffer=self.sampling_max_buffer)
 
+        self.model.regulariser_only = train_config.get("regulariser_only", False)
+
         # thresholding
         self.utility_threshold = train_config.get("regulariser_utility_threshold", 0.0)
         self.epoch_threshold = train_config.get("regulariser_epoch_threshold", 0)
@@ -150,7 +152,7 @@ class TrainManager:
 
         if self.bnn:
             if train_config.get('weight_decay', 0) == 0:
-                train_config['weight_decay'] = 1e-3
+                train_config['weight_decay'] = 1e-4
         # optimization
         self.learning_rate_min = train_config.get("learning_rate_min", 1.0e-8)
 
@@ -291,7 +293,7 @@ class TrainManager:
 
         # if not ddp, initialise wandb here
         if not self.ddp and self.use_wandb:
-            self.init_wandb(config)
+            init_wandb(config)
             wandb.watch(model)
         # fp16
         self.fp16 = train_config.get("fp16", False)
@@ -331,16 +333,7 @@ class TrainManager:
         self.train_sampler = None
         self.batch_sampler = None
 
-    @staticmethod
-    def init_wandb(config):
-        if 'wandb' not in sys.modules:
-            raise ImportError("Please install wandb to log with it ") from no_wandb
-        with open('wandb_api_key.txt', 'r') as f:
-            api_key = f.readline()
-        wandb.login(key=api_key)
-        # get non-checkpoint version
-        id = f"{config['training']['model_dir'].split('_cp')[0][-20:]}"
-        wandb.init(project="lcv-nmt", config=config, id=id, resume=True)
+
 
     def _save_checkpoint(self, new_best: bool = True, pre_calibration=False) -> None:
         """
@@ -549,7 +542,7 @@ class TrainManager:
         if self.rank == 0:
             self.tb_writer = SummaryWriter(log_dir=self.model_dir + "/tensorboard/")
             if self.use_wandb:
-                self.init_wandb(self.config)
+                init_wandb(self.config)
         # send back stats
         self.child_conn = child_conn
 
@@ -859,9 +852,7 @@ class TrainManager:
         # increment token counter
         self.stats.total_tokens += batch.ntokens
 
-        # batch_loss_over_k[i]=norm_batch_loss.item()
 
-        # todo what happens with log _dict
         return norm_batch_loss.item(), log_dict
 
     def _synch_reduce_ddp(self, score, reduce_type="mean"):
@@ -1234,6 +1225,16 @@ class TrainManager:
                 self.early_stopping = True
                 logger.info(f"Early stopping the training, best score is {self.best_ckpt_score:.4f}")
 
+def init_wandb(config):
+    if 'wandb' not in sys.modules:
+        raise ImportError("Please install wandb to log with it ") from no_wandb
+    with open('wandb_api_key.txt', 'r') as f:
+        api_key = f.readline()
+    wandb.login(key=api_key)
+    # get non-checkpoint version
+    id = f"{config['training']['model_dir'].split('_cp')[0][-20:]}"
+    wandb.init(project="lcv-nmt", config=config, id=id, resume=True)
+
 
 def train(cfg_file: str) -> None:
     """
@@ -1321,10 +1322,10 @@ def train(cfg_file: str) -> None:
         "trg_vocab": trg_vocab
     }
     logger.info(f"checkpoint name {ckpt}")
-    test(cfg_file,
-         ckpt=ckpt,
-         output_path=output_path,
-         datasets=datasets_to_test)
+    # test(cfg_file,
+    #      ckpt=ckpt,
+    #      output_path=output_path,
+    #      datasets=datasets_to_test)
 
 
 def spawn_multiprocess(train_fn, args):

@@ -7,9 +7,9 @@
 #SBATCH --job-name=DDP_regulariser
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --time=40:00:00
+#SBATCH --time=20:00:00
 #SBATCH --mem=64000M
-#SBATCH --output=../slurm/slurm_output_%A_regulariser_ddp_gpu.out
+#SBATCH --output=../slurm/slurm_output_%A_regulariser_3_ddp_gpu.out
 
 module purge
 module load 2019

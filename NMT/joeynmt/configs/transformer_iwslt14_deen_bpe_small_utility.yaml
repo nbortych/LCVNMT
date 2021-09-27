@@ -14,16 +14,23 @@ data:
   use_pickled_vocab: True
   src_vocab_pickle: "test/data/iwslt14/vocab.pickle"
   trg_vocab_pickle: "test/data/iwslt14/vocab.pickle"
+
 testing:
   beam_size: 1
   alpha: 1.0
-  # LC-NMT specific things
+  # LCV-NMT specific things
   small_test_run: True
   mbr: True
   mbr_type: "editdistance"
-  utility: "beer"
+  utility: "chrf"
   num_samples: 10
   save_utility_per_sentence: True
+  all_decoding_types: False
+  multi_utility: True
+  only_test: True
+  multi_mbr: True
+
+
 training:
 #  load_model: "models/iwslt14-deen-bpe-transformer_test/3.ckpt"
   random_seed: 42
@@ -45,7 +52,7 @@ training:
   validation_freq: 100
   logging_freq: 1
   eval_metric: ""
-  model_dir: "models/iwslt14-deen-bpe-transformer_test"#_checkpoint"
+  model_dir: "models/iwslt14-deen-bpe-transformer_test_9"#_checkpoint"
   overwrite: True
   shuffle: True
   use_cuda: True
@@ -70,7 +77,7 @@ training:
   distributed_batch_sampler: True
   mean_baseline: True
   vimco_baseline: True
-  wandb: False
+  wandb: True
   early_stopping: True
   validation_stopping: False
   early_stopping_patience: 10

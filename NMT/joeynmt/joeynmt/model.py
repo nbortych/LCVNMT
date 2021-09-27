@@ -32,7 +32,8 @@ class Model(nn.Module):
                  src_embed: Embeddings,
                  trg_embed: Embeddings,
                  src_vocab: Vocabulary,
-                 trg_vocab: Vocabulary) -> None:
+                 trg_vocab: Vocabulary,
+                 regulariser_only = False) -> None:
         """
         Create a new encoder-decoder model
 
@@ -55,6 +56,7 @@ class Model(nn.Module):
         self.pad_index = self.trg_vocab.stoi[PAD_TOKEN]
         self.eos_index = self.trg_vocab.stoi[EOS_TOKEN]
         self._loss_function = None  # set by the TrainManager
+        self.regulariser_only = regulariser_only
 
     @property
     def loss_function(self):
@@ -93,7 +95,10 @@ class Model(nn.Module):
             # logger.info(f"log probs shape {log_probs.shape}")
             # compute batch loss
             if return_type == "loss":
-                batch_loss = self.loss_function(log_probs, kwargs["trg"])
+                if self.regulariser_only:
+                    batch_loss = torch.tensor(0., device=kwargs['trg_input'].device)
+                else:
+                    batch_loss = self.loss_function(log_probs, kwargs["trg"])
             elif return_type == "log_prob":
                 batch_loss = self.loss_function(log_probs, kwargs["trg"], reduce=False)
             utility_reg = kwargs.get("utility_regularising", False)

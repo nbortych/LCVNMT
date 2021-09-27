@@ -1,16 +1,14 @@
 #!/bin/bash
 
-#SBATCH --partition=gpu
-
-#_short
+#SBATCH --partition=gpu_short
 #_shared
-#SBATCH --gres=gpu:4
-#SBATCH --job-name=DDP_regulariser
+#SBATCH --gres=gpu:1
+#SBATCH --job-name=Test
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --time=60:00:00
-#SBATCH --mem=64000M
-#SBATCH --output=../slurm/slurm_output_%A_regulariser_0_ddp_gpu.out
+#SBATCH --time=00:20:00
+#SBATCH --mem=32000M
+#SBATCH --output=../slurm/slurm_output_%A_test_test_1_gpu.out
 
 module purge
 module load 2019
@@ -28,14 +26,13 @@ cd ..
 cd $HOME/joeynmt
 
 pip install --user -r requirements.txt
-# pip install --user --editable .
-# pip install --user wandb
+pip install --user --editable .
+pip install --user wandb
 pip install --user ../mbr-nmt/
-pip install --user ../sacrebleu-master/
 
 # BEER utility
 export BEER_HOME=./beer_2.0
 chmod +x ./beer_2.0/scripts/interactive
 
 # Run your code
-srun python -m joeynmt train configs/transformer_iwslt14_deen_bpe_regulariser_0.yaml #
+srun python -m joeynmt test configs/transformer_iwslt14_deen_bpe_small_utility.yaml #

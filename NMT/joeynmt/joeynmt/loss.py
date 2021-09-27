@@ -146,7 +146,7 @@ class XentLoss(nn.Module):
         # computing utility
         # utility logging (pun intended)
         log_uh = torch.log(u_h).detach()
-        log_dict['u_h'] = u_h.detach().clone().mean(dim=1).numpy()
+        log_dict['u_h'] = u_h.detach().clone().mean().numpy()
         log_dict['mean_utility'] = u_h.mean().item()
         log_dict['log_u_h'] = log_uh.mean().item()
         # control variates for utility
