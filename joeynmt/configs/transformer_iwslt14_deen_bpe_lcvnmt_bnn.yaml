@@ -25,13 +25,17 @@ testing:
     utility: "chrf"
     num_samples: 10
     save_utility_per_sentence: True
-    all_decoding_types: True
+    all_decoding_types: False
     multi_utility: True
     only_test: True
+    multi_mbr: True
 
 training:
-    load_model: "models/iwslt14_deen_bpe_transformer_regulariser_6_lr3/latest.ckpt"
-#    load_model: "models/iwslt14_deen_bpe_transformer_precalibration_1/best.ckpt"
+#    load_model: "models/iwslt14_deen_bpe_transformer_lcvnmt_1_cp/latest.ckpt" # checkpoint
+#    load_model: "models/iwslt14_deen_bpe_transformer_bnn_3_lr0/best.ckpt" #  based on best bnn
+#    load_model: "models/iwslt14_deen_bpe_transformer_bnn_3_lr0_pretrain/best.ckpt" #  based on pretrained bnn
+#    load_model: "models/iwslt14_deen_bpe_transformer_precalibration_1/best.ckpt" # checkpoint based on baseline pretrained
+#    load_model: "models/iwslt14_deen_bpe_transformer_lcvnmt_3/latest.ckpt" # checkpoint based on baseline pretrained
 #    reset_best_ckpt: True
 #    reset_scheduler: True
 #    reset_optimizer: True
@@ -43,20 +47,22 @@ training:
     patience: 10
     decrease_factor: 0.7
     loss: "crossentropy"
-    learning_rate: 0.0000003
-    learning_rate_min: 0.0000000001
-    weight_decay: 0.0
+    learning_rate: 0.000003
+    learning_rate_min: 0.00000001
+    weight_decay: 0.0001
     label_smoothing: 0
     batch_size: 10
     batch_multiplier: 1
-#    eval_batch_size: 64
+    eval_batch_size: 1
     batch_type: "sentence"
     early_stopping_metric: "utility"
     epochs: 2
     validation_freq: 10000
     logging_freq: 500
     eval_metric: ''
-    model_dir: "models/iwslt14_deen_bpe_transformer_regulariser_6_lr3"
+    # 0 - lcvnmt based on baseline, 1 based on best bnn,2 form scratch,  3 based on pretrained bnn
+#    model_dir: "models/iwslt14_deen_bpe_transformer_lcvnmt_1_cp1"
+    model_dir: "models/iwslt14_deen_bpe_transformer_lcvnmt_3"
     overwrite: False
     shuffle: True
     use_cuda: True
@@ -84,6 +90,7 @@ training:
     early_stopping_patience: 18
     validation_precompute_batch: True
     steps_per_batch: 5
+    bnn: True
 
 
 ##

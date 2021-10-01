@@ -1,0 +1,40 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu
+#_short
+#_shared
+#SBATCH --gres=gpu:1
+#SBATCH --job-name=DDP_regulariser
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --time=01:00:00
+#SBATCH --mem=64000M
+#SBATCH --output=../slurm/slurm_output_%A_regulariser_3_test_gpu.out
+
+module purge
+module load 2019
+module load Python/3.7.5-foss-2019b
+module load CUDA/10.1.243
+module load cuDNN/7.6.5.32-CUDA-10.1.243
+module load NCCL/2.5.6-CUDA-10.1.243
+module load Anaconda3/2018.12
+
+# pip install --user --upgrade pip
+
+cd ..
+
+# Your job starts in the directory where you call sbatch
+cd $HOME/joeynmt
+
+pip install --user -r requirements.txt
+# pip install --user --editable .
+# pip install --user wandb
+pip install --user ../mbr-nmt/
+pip install --user ../sacrebleu-master/
+
+# BEER utility
+export BEER_HOME=./beer_2.0
+chmod +x ./beer_2.0/scripts/interactive
+
+# Run your code
+srun python -m joeynmt test configs/transformer_iwslt14_deen_bpe_regulariser_final.yaml #

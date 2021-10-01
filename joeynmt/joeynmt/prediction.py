@@ -471,7 +471,7 @@ def test(cfg_file,
     if all_decoding_types:
         decoding_types = ["beam", "greedy", "mbr"]
     elif multi_mbr:
-        decoding_types = ["mbr_80"]#["mbr_10", "mbr_20", "mbr_40", "mbr_80"]
+        decoding_types = ["mbr_10", "mbr_20","mbr_80"]
     else:
         decoding_types = [None]
 
@@ -927,52 +927,6 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
         return return_dict
 
 
-    else:
-        from mbr_nmt import mbr, utility
-        utility_fn = utility.parse_utility('meteor', 'en')
-
-        # make it list of batches with list of samples inside: BxSxL
-        print(samples[0].shape, samples[1].shape)
-        batch_first_samples = np.empty((samples[0].shape[0], len(samples), samples[0].shape[1]))
-        print(batch_first_samples.shape)
-
-        for i, sample in enumerate(samples):
-            batch_first_samples[:, i, :] = sample
-
-        # print(batch_first_samples)
-        # print(batch_first_samples.tolist())
-        # each batch is converted to list
-        # string_samples = list(map(lambda batch: list(map(lambda sentence: " ".join(list(map(str, sentence))), batch)), batch_first_samples.tolist()))
-        # todo fix meteor
-        # convert to string in list of lists of lists
-        string_samples = batch_first_samples.astype("U10").tolist()
-        # join the sentences
-        string_samples = list(map(lambda batch: list(map(lambda sample: ' '.join(sample), batch)), string_samples))
-        # string_samples = list(map(lambda sample: list(map(lambda sentence: list(map(str, sentence)), sample.tolist())), samples))
-        print(samples[0].shape)
-        print(string_samples)
-        print(len(string_samples), len(string_samples[0]), len(string_samples[0][0]))
-        # string_samples = list(map(lambda sample: list(map(lambda batch: ''.join(list(map(str,batch))) , sample.tolist()) ),big_l))
-        prediction_idx, prediction = mbr.mbr(string_samples, utility_fn)
-        return prediction
-
-
-# def eval_utility(*args):
-#     # print(os.listdir())
-#     utility_fn = get_utility_fn("beer")
-#     utility =  utility_fn(*args)
-#     utility_fn.proc.kill()
-#     return utility
-
-# calling the call_batch function
-# def batch_call_utility_fn(batch_combinations_of_samples, utility_fn):
-#     hyp_ref_batches = [zip(*batch) for batch in batch_combinations_of_samples]
-#     hyp_batch, ref_batch = (), ()
-#     for h, r in hyp_ref_batches:
-#         hyp_batch += h
-#         ref_batch += r
-#     # logger.info(f"len {len(hyp_batch)}, {len(ref_batch)}, batch size {batch_size}, num samples{num_samples}")
-#     utilities = torch.tensor([utility_fn.call_batch(hyp_batch, ref_batch)], dtype=torch.float)
 
 # eval utility of a single batch
 def eval_utility_batch(batch, utility_fn):
@@ -988,17 +942,6 @@ def eval_utility_chunked_batch(batches_and_fn):
                combinations_of_samples in batches]
     return utility
 
-
-# eval utility of multiple batches
-#     with mp.Pool(cpus) as p:
-#         utilities = p.map(eval_utility_batches, chunked_batch_combinations_of_samples)
-
-# def eval_utility_batches(batches):
-#     utility_fn = get_utility_fn("beer")
-#     utility = [list(itertools.starmap(utility_fn, combinations_of_samples)) for
-#                combinations_of_samples in batches]
-#     # utility = [utility_fn(*combination_of_samples) for combination_of_samples in batch]
-#     return utility
 
 
 if __name__ == "__main__":
