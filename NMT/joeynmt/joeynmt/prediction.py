@@ -12,25 +12,33 @@ import editdistance
 
 import numpy as np
 import torch
-from torchtext.data import Dataset, Field
+import multiprocessing as mp
+from multiprocessing.pool import ThreadPool
+from torchtext.legacy.data import Field
+from torch.utils.data import Dataset, Subset
+# from torch.utils.data.distributed import DistributedSampler
+import sacrebleu
+from sacrebleu.metrics import BLEU, CHRF
 
+import wandb
 from joeynmt.helpers import bpe_postprocess, load_config, make_logger, \
-    get_latest_checkpoint, load_checkpoint, store_attention_plots
+    get_latest_checkpoint, load_checkpoint, store_attention_plots, debug_memory, repeat_batch
 from joeynmt.metrics import bleu, chrf, token_accuracy, sequence_accuracy
 from joeynmt.model import build_model, Model, _DataParallel
 from joeynmt.search import run_batch
 from joeynmt.batch import Batch
-from joeynmt.data import load_data, make_data_iter, MonoDataset
+from joeynmt.data import load_data, make_dataloader, MonoDataset, DistributedEvalSampler
 from joeynmt.constants import UNK_TOKEN, PAD_TOKEN, EOS_TOKEN
 from joeynmt.vocabulary import Vocabulary
 
-# import os
-# ROOT_DIR = os.path.abspath(os.curdir)
-# print(ROOT_DIR)
-# import ..mbr_nmt.utility as utility
-
+try:
+    os.environ["BEER_HOME"]
+except:
+    os.environ["BEER_HOME"] = "./beer_2.0"
 
 logger = logging.getLogger(__name__)
+
+logger.info(f'Sacrebleu version {sacrebleu.__version__}')
 
 
 # pylint: disable=too-many-arguments,too-many-locals,no-member
@@ -45,14 +53,20 @@ def validate_on_data(model: Model, data: Dataset,
                      batch_type: str = "sentence",
                      postprocess: bool = True,
                      bpe_type: str = "subword-nmt",
-                     sacrebleu: dict = None,
+                     sacrebleu_dict: dict = None,
                      sample: bool = False,
                      mbr: bool = False,
                      mbr_type: str = 'editdistance',
                      small_test_run: bool = False,
                      num_samples: int = 10,
                      save_utility_per_sentence: bool = False,
-                     utility_type=None) \
+                     utility_type=None,
+                     rank=0,
+                     world_size=1,
+                     utility_regularising_loss=False,
+                     precompute_batch=False,
+                     dynamic_max_output=False,
+                     multi_utility=False) \
         -> (float, float, float, List[str], List[List[str]], List[str],
             List[str], List[List[str]], List[np.array]):
     """
@@ -78,7 +92,7 @@ def validate_on_data(model: Model, data: Dataset,
     :param batch_type: validation batch type (sentence or token)
     :param postprocess: if True, remove BPE segmentation from translations
     :param bpe_type: bpe type, one of {"subword-nmt", "sentencepiece"}
-    :param sacrebleu: sacrebleu options
+    :param sacrebleu_dict: sacrebleu_dict options
     :param sample: If True, non-greedy sampling during greedy decoding
     :param mbr:  If True, will use mbr for decoding
 
@@ -93,9 +107,11 @@ def validate_on_data(model: Model, data: Dataset,
         - decoded_valid: raw validation hypotheses (before post-processing),
         - valid_attention_scores: attention scores for validation hypotheses
     """
-    assert batch_size >= n_gpu, "batch_size must be bigger than n_gpu."
-    if sacrebleu is None:  # assign default value
-        sacrebleu = {"remove_whitespace": True, "tokenize": "13a"}
+    model.ddp = getattr(model, "ddp", False)
+    if not model.ddp and isinstance(model, torch.nn.DataParallel):
+        assert batch_size >= n_gpu, "batch_size must be bigger than n_gpu."
+    if sacrebleu_dict is None:  # assign default value
+        sacrebleu_dict = {"remove_whitespace": True, "tokenize": "13a"}
     if batch_size > 1000 and batch_type == "sentence":
         logger.warning(
             "WARNING: Are you sure you meant to work on huge batches like "
@@ -105,51 +121,91 @@ def validate_on_data(model: Model, data: Dataset,
 
     # if small test run, use subset of the data that is one batch
     if small_test_run:
-        data, _ = data.split(0.0005)
-        logger.info(f"The lenght of validation data for small test run is {len(data)}")
+        SMALL_DATA_SIZE = 100
+
+        val_subset_data, _ = torch.utils.data.random_split(data,
+                                                           [SMALL_DATA_SIZE, len(data) - SMALL_DATA_SIZE],
+                                                           torch.Generator().manual_seed(42))
+        val_subset_data.src_vocab = data.src_vocab
+        val_subset_data.trg_vocab = data.trg_vocab
+        data = val_subset_data
+        logger.info(f"The length of validation data for small test run is {len(data)}")
         # batch_size = len(data)
 
-    valid_iter = make_data_iter(
-        dataset=data, batch_size=batch_size, batch_type=batch_type,
-        shuffle=False, train=False)
-    valid_sources_raw = data.src
+    if model.ddp:
+        ddp_sampler = DistributedEvalSampler(data, num_replicas=world_size, rank=rank)
+        ddp_indices = ddp_sampler.indices
+    else:
+        ddp_sampler = None
+
+    valid_dataloader = make_dataloader(dataset=data, batch_size=batch_size,
+                                       shuffle=False, train=False, sampler=ddp_sampler)
+    valid_sources_raw = [src for src, _, trg, _ in data]
     pad_index = model.src_vocab.stoi[PAD_TOKEN]
     # disable dropout
-    model.eval()
-    # don't track gradients during validation
+    if not getattr(model, "bnn", False):
+        model.eval()
+    # initialise utility function just once
+    if mbr:
+        if utility_type == "beer":
+            # logger.info(f"Number of cpu is {mp.cpu_count()} rank {rank}, world size {world_size}")
+            utility_fn = [get_utility_fn(utility_type) for _ in range(mp.cpu_count() // world_size)]
+        else:
+            utility_fn = get_utility_fn(utility_type)
+    else:
+        utility_fn = None
+        # don't track gradients during validation
     with torch.no_grad():
         all_outputs = []
         valid_attention_scores = []
         total_loss = 0
         total_ntokens = 0
         total_nseqs = 0
-        for valid_batch in iter(valid_iter):
+        encoder_hidden, encoder_output = None, None
+        expected_utility_total = 0
+        # gather subset of data
+        for i, valid_batch in enumerate(valid_dataloader):
             # run as during training to get validation loss (e.g. xent)
 
-            batch = batch_class(valid_batch, pad_index, use_cuda=use_cuda)
+            batch = batch_class(valid_batch, pad_index, use_cuda=use_cuda, device=model.device)
             # sort batch now by src length and keep track of order
             sort_reverse_index = batch.sort_by_src_length()
 
             # run as during training with teacher forcing
             if compute_loss and batch.trg is not None:
-                batch_loss, _, _, _ = model(return_type="loss", **{"batch": batch, **vars(batch)})
-                if n_gpu > 1:
+                batch_loss, _, encoder_output, encoder_hidden = model(return_type="loss", **{"batch": batch,
+                                                                                             "utility_regularising": utility_regularising_loss,
+                                                                                             'utility_type': utility_type,
+                                                                                             **vars(batch),
+                                                                                             "return_encoded": mbr and precompute_batch})
+
+                if n_gpu > 1 and not model.ddp:
                     batch_loss = batch_loss.mean()  # average on multi-gpu
                 total_loss += batch_loss
                 total_ntokens += batch.ntokens
                 total_nseqs += batch.nseqs
 
+            if dynamic_max_output:
+                max_output_length = model.loss_function.dynamic_match_sample_size(batch)
             # run as during inference to produce translations
             if not mbr:
                 output, attention_scores = run_batch(
                     model=model, batch=batch, beam_size=beam_size,
                     beam_alpha=beam_alpha, max_output_length=max_output_length, sample=sample)
             else:
-                output = mbr_decoding(model=model, batch=batch, max_output_length=max_output_length,
-                                      compute_log_probs=False, need_grad=False, return_types=["h"],
-                                      num_samples=num_samples, mbr_type=mbr_type)[0]
-                attention_scores = None
+                # logger.info(f"Validation batch {i}/{len(valid_dataloader)}, rank {rank}")
+                mbr_dict = mbr_decoding(model=model, batch=batch, max_output_length=max_output_length,
+                                        compute_log_probs=False, need_grad=False,
+                                        return_types=["h", "mean_batch_expected_uility_h"],
+                                        num_samples=num_samples, mbr_type=mbr_type,
+                                        utility_type=utility_type,
+                                        utility_fn=utility_fn,
+                                        encoded_batch=[encoder_output, encoder_hidden],
+                                        small_test_run=small_test_run, rank=rank, world_size=world_size)
 
+                output, expected_utility = mbr_dict['h'], mbr_dict['mean_batch_expected_uility_h']
+                attention_scores = None
+                expected_utility_total += expected_utility
             # sort outputs back to original order
             all_outputs.extend(output[sort_reverse_index])
 
@@ -157,13 +213,17 @@ def validate_on_data(model: Model, data: Dataset,
                 attention_scores[sort_reverse_index]
                 if attention_scores is not None and type(attention_scores) != int else [])
 
+        # get only the data on the current gpu
+        if model.ddp:
+            data = Subset(data, indices=ddp_indices)
         assert len(all_outputs) == len(data)
-
+        expected_utility_mean = expected_utility_total / len(valid_dataloader)
         if compute_loss and total_ntokens > 0:
-            # total validation loss
-            valid_loss = total_loss
             # exponent of token-level negative log prob
-            valid_ppl = torch.exp(total_loss / total_ntokens)
+            valid_ppl = torch.exp(total_loss / total_ntokens).item()
+            # total validation loss
+            valid_loss = total_loss.item() / len(valid_dataloader)
+
         else:
             valid_loss = -1
             valid_ppl = -1
@@ -174,8 +234,8 @@ def validate_on_data(model: Model, data: Dataset,
 
         # evaluate with metric on full dataset
         join_char = " " if level in ["word", "bpe"] else ""
-        valid_sources = [join_char.join(s) for s in data.src]
-        valid_references = [join_char.join(t) for t in data.trg]
+        valid_sources_and_references = [(join_char.join(s), join_char.join(t)) for s, _, t, _ in data]
+        valid_sources, valid_references = zip(*valid_sources_and_references)
         valid_hypotheses = [join_char.join(t) for t in decoded_valid]
 
         # post-process
@@ -196,36 +256,50 @@ def validate_on_data(model: Model, data: Dataset,
                 # this version does not use any tokenization
                 current_valid_score = bleu(
                     valid_hypotheses, valid_references,
-                    tokenize=sacrebleu["tokenize"])
+                    tokenize=sacrebleu_dict["tokenize"])
             elif eval_metric.lower() == 'chrf':
                 current_valid_score = chrf(valid_hypotheses, valid_references,
-                                           remove_whitespace=sacrebleu["remove_whitespace"])
+                                           remove_whitespace=sacrebleu_dict["remove_whitespace"])
             elif eval_metric.lower() == 'token_accuracy':
                 current_valid_score = token_accuracy(  # supply List[List[str]]
+                    # todo remove data.trg
                     list(decoded_valid), list(data.trg))
             elif eval_metric.lower() == 'sequence_accuracy':
                 current_valid_score = sequence_accuracy(
                     valid_hypotheses, valid_references)
-            elif eval_metric.lower() == 'meteor':
-                current_valid_score = meteor_utility(
-                    valid_hypotheses, valid_references)
+            else:
+                current_valid_score = -1
             # compute utility
-            if utility_type is not None:
+            if utility_type is not None and not multi_utility:
+                reduced_utility, utility_per_sentence = get_utility_of_samples(utility_type, valid_hypotheses,
+                                                                               valid_references, reduce_type="mean",
+                                                                               save_utility_per_sentence=save_utility_per_sentence)
+            elif multi_utility:
+                reduced_utility, utility_per_sentence = [], []
+                for utility in ["beer", "chrf", "bleu"]:
+                    reduced, per_sentence = get_utility_of_samples(utility, valid_hypotheses,
+                                                                   valid_references, reduce_type="mean",
+                                                                   save_utility_per_sentence=save_utility_per_sentence)
+                    reduced_utility.append(reduced)
+                    utility_per_sentence.append(per_sentence)
 
-                if utility_type == "editdistance":
-                    utility = edit_distance_utility(valid_hypotheses, valid_references, reduce_type="sum")
+            else:
+                reduced_utility = 0
+                utility_per_sentence = None
         else:
             current_valid_score = -1
-            utility = 0
-
-        # saves utility per sentence. Not implemented yet
-        # todo implement. ask Wilker more about utility
-        # if save_utility_per_sentence:
-        #     get_utility_per_sentence(eval_metric.lower(), valid_hypotheses, valid_references)
+            reduced_utility = 0
+            utility_per_sentence = None
+    # terminate open processes
+    if type(utility_fn) == list and utility_type == "beer":
+        for utility in utility_fn:
+            utility.proc.terminate()
+    elif utility_type == "beer" and utility_fn is not None:
+        utility_fn.proc.terminate()
 
     return current_valid_score, valid_loss, valid_ppl, valid_sources, \
            valid_sources_raw, valid_references, valid_hypotheses, \
-           decoded_valid, valid_attention_scores, utility
+           decoded_valid, valid_attention_scores, reduced_utility, utility_per_sentence, expected_utility_mean
 
 
 def parse_test_args(cfg, mode="test"):
@@ -282,6 +356,12 @@ def parse_test_args(cfg, mode="test"):
         num_samples = cfg["testing"].get("num_samples", 10)
         mbr_type = cfg["testing"].get("mbr_type", 'editdistance')
         utility_type = cfg["testing"].get("utility", 'editdistance')
+        save_utility_per_sentence = cfg["testing"].get("save_utility_per_sentence", False)
+        all_decoding_types = cfg["testing"].get("all_decoding_types", False)
+        multi_utility = cfg["testing"].get("multi_utility", False)
+        multi_mbr = cfg["testing"].get("multi_mbr", False)
+        only_test = cfg["testing"].get("only_test", False)
+
 
     else:
         beam_size = 1
@@ -295,6 +375,11 @@ def parse_test_args(cfg, mode="test"):
         num_samples = 1
         mbr_type = 'editdistance'
         utility_type = None
+        save_utility_per_sentence = False
+        all_decoding_types = False
+        multi_utility = False
+        multi_mbr = False
+        only_test = False
 
     mbr_text, empty = f"{mbr_type}_MBR_", ""
     decoding_description = f"{'Greedy decoding' if (not sample and not mbr) else f'{mbr_text if mbr else empty}Sample decoding'}" if beam_size < 2 else \
@@ -307,7 +392,9 @@ def parse_test_args(cfg, mode="test"):
     return batch_size, batch_type, use_cuda, device, n_gpu, level, \
            eval_metric, max_output_length, beam_size, beam_alpha, \
            postprocess, bpe_type, sacrebleu, decoding_description, \
-           tokenizer_info, sample, mbr, mbr_type, small_test_run, num_samples, utility_type
+           tokenizer_info, sample, mbr, mbr_type, small_test_run, \
+           num_samples, utility_type, save_utility_per_sentence, \
+           all_decoding_types, multi_utility, multi_mbr, only_test
 
 
 # pylint: disable-msg=logging-too-many-args
@@ -332,34 +419,43 @@ def test(cfg_file,
     test_start_time = time.time()
     cfg = load_config(cfg_file)
     model_dir = cfg["training"]["model_dir"]
+    from joeynmt.training import init_wandb
+    init_wandb(cfg)
 
     if len(logger.handlers) == 0:
         _ = make_logger(model_dir, mode="test")  # version string returned
 
     # when checkpoint is not specified, take latest (best) from model dir
     if ckpt is None:
-        ckpt = get_latest_checkpoint(model_dir)
+        ckpt = f"{model_dir}/best.ckpt"
+        if not os.path.exists(ckpt):
+            ckpt = get_latest_checkpoint(model_dir)
         try:
             step = ckpt.split(model_dir + "/")[1].split(".ckpt")[0]
         except IndexError:
             step = "best"
+    logger.info(f"Loading checkpoint {step}")
+    # parse test args
+    batch_size, batch_type, use_cuda, device, n_gpu, level, eval_metric, \
+    max_output_length, beam_size, beam_alpha, postprocess, \
+    bpe_type, sacrebleu, decoding_description, tokenizer_info, \
+    sample, mbr, mbr_type, small_test_run, num_samples, utility_type, \
+    save_utility_per_sentence, all_decoding_types, multi_utility, multi_mbr, \
+    only_test = parse_test_args(cfg, mode="test")
 
     # load the data
     if datasets is None:
         _, dev_data, test_data, src_vocab, trg_vocab = load_data(
             data_cfg=cfg["data"], datasets=["dev", "test"])
-        data_to_predict = {"dev": dev_data, "test": test_data}
+        data_to_predict = {"test": test_data}
+        if not only_test:
+            data_to_predict["dev"] = dev_data
     else:  # avoid to load data again
-        data_to_predict = {"dev": datasets["dev"], "test": datasets["test"]}
+        data_to_predict = {"test": datasets["test"]}
+        if not only_test:
+            data_to_predict["dev"] = datasets["dev"]
         src_vocab = datasets["src_vocab"]
         trg_vocab = datasets["trg_vocab"]
-
-    # parse test args
-    batch_size, batch_type, use_cuda, device, n_gpu, level, eval_metric, \
-    max_output_length, beam_size, beam_alpha, postprocess, \
-    bpe_type, sacrebleu, decoding_description, tokenizer_info, \
-    sample, mbr, mbr_type, small_test_run, num_samples, utility_type \
-        = parse_test_args(cfg, mode="test")
 
     # load model state from disk
     model_checkpoint = load_checkpoint(ckpt, use_cuda=use_cuda)
@@ -367,12 +463,23 @@ def test(cfg_file,
     # build model and load parameters into it
     model = build_model(cfg["model"], src_vocab=src_vocab, trg_vocab=trg_vocab)
     model.load_state_dict(model_checkpoint["model_state"])
+    model.device = device
 
     if use_cuda:
         model.to(device)
 
+    if all_decoding_types:
+        decoding_types = ["beam", "greedy", "mbr"]
+    elif multi_mbr:
+        decoding_types = ["mbr_80"]#["mbr_10", "mbr_20", "mbr_40", "mbr_80"]
+    else:
+        decoding_types = [None]
+
+
     # multi-gpu eval
-    if n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
+    # todo fix multigpu (DDP has problems with returning dict + if data is not devisable by n_gpu)
+    if n_gpu > 1 and not isinstance(model, torch.nn.DataParallel) and not model_checkpoint['ddp']:
+        logger.info("Got into multigpu during testing")
         model = _DataParallel(model)
 
     for data_set_name, data_set in data_to_predict.items():
@@ -381,51 +488,90 @@ def test(cfg_file,
 
         dataset_file = cfg["data"][data_set_name] + "." + cfg["data"]["trg"]
         logger.info("Decoding on %s set (%s)...", data_set_name, dataset_file)
+        for decoding_type in decoding_types:
+            if decoding_type == None:
+                pass
+            else:
+                logger.info(f"Decoding using {decoding_type} decoding.")
+                if decoding_type == "beam":
+                    beam_size = 5
+                    mbr = False
+                elif decoding_type == "greedy":
+                    beam_size = 1
+                    mbr = False
+                elif decoding_type == "mbr":
+                    beam_size = 1
+                    mbr = True
+                elif decoding_type.split("_")[0] == "mbr":
+                    beam_size = 1
+                    mbr = True
+                    num_samples = int(decoding_type.split("_")[1])
 
-        # pylint: disable=unused-variable
-        score, loss, ppl, sources, sources_raw, references, hypotheses, \
-        hypotheses_raw, attention_scores, utility = validate_on_data(
-            model, data=data_set, batch_size=batch_size,
-            batch_class=batch_class, batch_type=batch_type, level=level,
-            max_output_length=max_output_length, eval_metric=eval_metric,
-            use_cuda=use_cuda, compute_loss=False, beam_size=beam_size,
-            beam_alpha=beam_alpha, postprocess=postprocess,
-            bpe_type=bpe_type, sacrebleu=sacrebleu, n_gpu=n_gpu, sample=sample, mbr=mbr,
-            small_test_run=small_test_run, num_samples=num_samples, mbr_type=mbr_type,
-            save_utility_per_sentence=save_utility_per_sentence, utility_type=utility_type)
-        # pylint: enable=unused-variable
+            # pylint: disable=unused-variable
+            score, loss, ppl, sources, sources_raw, references, hypotheses, \
+            hypotheses_raw, attention_scores, utility, utility_per_sentence, expected_utility_mean = validate_on_data(
+                model, data=data_set, batch_size=batch_size,
+                batch_class=batch_class, batch_type=batch_type, level=level,
+                max_output_length=max_output_length, eval_metric=eval_metric,
+                use_cuda=use_cuda, compute_loss=False, beam_size=beam_size,  # 5 beam_size
+                beam_alpha=beam_alpha, postprocess=postprocess,
+                bpe_type=bpe_type, sacrebleu_dict=sacrebleu, n_gpu=n_gpu, sample=sample, mbr=mbr,  # mbr
+                small_test_run=small_test_run, num_samples=num_samples, mbr_type=mbr_type,
+                save_utility_per_sentence=save_utility_per_sentence, utility_type=utility_type,
+                multi_utility=multi_utility)
+            # pylint: enable=unused-variable
 
-        if "trg" in data_set.fields:
+            # if "trg" in data_set.fields:
             logger.info("%4s %s%s: %6.2f [%s]",
                         data_set_name, eval_metric, tokenizer_info,
                         score, decoding_description)
-        else:
-            logger.info("No references given for %s -> no evaluation.",
-                        data_set_name)
 
-        if save_attention:
-            if attention_scores:
-                attention_name = "{}.{}.att".format(data_set_name, step)
-                attention_path = os.path.join(model_dir, attention_name)
-                logger.info("Saving attention plots. This might take a while..")
-                store_attention_plots(attentions=attention_scores,
-                                      targets=hypotheses_raw,
-                                      sources=data_set.src,
-                                      indices=range(len(hypotheses)),
-                                      output_prefix=attention_path)
-                logger.info("Attention plots saved to: %s", attention_path)
+            log_names, log_values = ["score", 'loss', "ppl", "expected_utility_mean"], [score, loss, ppl,
+                                                                                        expected_utility_mean]
+
+            if not multi_utility:
+                log_names.extend([f"utility_{utility_type}", "utility_per_sentence"])
+                log_values.extend([utility, wandb.Histogram(utility_per_sentence)])
             else:
-                logger.warning("Attention scores could not be saved. "
-                               "Note that attention scores are not available "
-                               "when using beam search. "
-                               "Set beam_size to 1 for greedy decoding.")
+                log_names.extend(["utility_beer", "utility_chrf", "utility_bleu", "utility_per_sentence_beer",
+                                  "utility_per_sentence_chrf", "utility_per_sentence_bleu"])
+                log_values.extend(utility)
+                histograms = list(map(wandb.Histogram, utility_per_sentence))
+                log_values.extend(histograms)
 
-        if output_path is not None:
-            output_path_set = "{}.{}".format(output_path, data_set_name)
-            with open(output_path_set, mode="w", encoding="utf-8") as out_file:
-                for hyp in hypotheses:
-                    out_file.write(hyp + "\n")
-            logger.info("Translations saved to: %s", output_path_set)
+            log_dict = {f"test/{decoding_type if decoding_type is not None else 'mbr'}/{step if step == 'best' else 'converged'}/{key}": value for key, value
+                        in
+                        zip(log_names, log_values)}
+
+            wandb.log(log_dict)
+
+            # else:
+            #     logger.info("No references given for %s -> no evaluation.",
+            #                 data_set_name)
+
+            if save_attention:
+                if attention_scores:
+                    attention_name = "{}.{}.att".format(data_set_name, step)
+                    attention_path = os.path.join(model_dir, attention_name)
+                    logger.info("Saving attention plots. This might take a while..")
+                    store_attention_plots(attentions=attention_scores,
+                                          targets=hypotheses_raw,
+                                          sources=data_set.src,
+                                          indices=range(len(hypotheses)),
+                                          output_prefix=attention_path)
+                    logger.info("Attention plots saved to: %s", attention_path)
+                else:
+                    logger.warning("Attention scores could not be saved. "
+                                   "Note that attention scores are not available "
+                                   "when using beam search. "
+                                   "Set beam_size to 1 for greedy decoding.")
+
+            if output_path is not None:
+                output_path_set = "{}.{}".format(output_path, data_set_name)
+                with open(output_path_set, mode="w", encoding="utf-8") as out_file:
+                    for hyp in hypotheses:
+                        out_file.write(hyp + "\n")
+                logger.info("Translations saved to: %s", output_path_set)
         test_duration = time.time() - test_start_time
         logger.info(f"Test duration was {test_duration:.2f}")
 
@@ -467,16 +613,17 @@ def translate(cfg_file: str,
         return test_data
 
     def _translate_data(test_data):
+        # todo modernize data
         """ Translates given dataset, using parameters from outer scope. """
         # pylint: disable=unused-variable
         score, loss, ppl, sources, sources_raw, references, hypotheses, \
-        hypotheses_raw, attention_scores, utility = validate_on_data(
+        hypotheses_raw, attention_scores, utility, utility_per_sentence, expected_utility_mean = validate_on_data(
             model, data=test_data, batch_size=batch_size,
             batch_class=batch_class, batch_type=batch_type, level=level,
             max_output_length=max_output_length, eval_metric="",
             use_cuda=use_cuda, compute_loss=False, beam_size=beam_size,
             beam_alpha=beam_alpha, postprocess=postprocess,
-            bpe_type=bpe_type, sacrebleu=sacrebleu, n_gpu=n_gpu, sample=sample, mbr=mbr,
+            bpe_type=bpe_type, sacrebleu_dict=sacrebleu, n_gpu=n_gpu, sample=sample, mbr=mbr,
             mbr_type=mbr_type,
             small_test_run=small_test_run, num_samples=num_samples)
         return hypotheses
@@ -514,7 +661,7 @@ def translate(cfg_file: str,
     batch_size, batch_type, use_cuda, device, n_gpu, level, _, \
     max_output_length, beam_size, beam_alpha, postprocess, \
     bpe_type, sacrebleu, _, _, sample, mbr, mbr_type, small_test_run, \
-    num_samples, utility_type = parse_test_args(cfg, mode="translate")
+    num_samples, utility_type, save_utility_per_sentence, _, _, _, _ = parse_test_args(cfg, mode="translate")
 
     # load model state from disk
     model_checkpoint = load_checkpoint(ckpt, use_cuda=use_cuda)
@@ -522,7 +669,7 @@ def translate(cfg_file: str,
     # build model and load parameters into it
     model = build_model(cfg["model"], src_vocab=src_vocab, trg_vocab=trg_vocab)
     model.load_state_dict(model_checkpoint["model_state"])
-
+    model.device = device
     if use_cuda:
         model.to(device)
 
@@ -565,91 +712,219 @@ def translate(cfg_file: str,
                 break
 
 
-def meteor_utility(candidate, sample):
-    from mbr_nmt.utility import parse_utility
-    utility_fn = parse_utility('meteor', lang='en')
-    return utility_fn(hyp=candidate, ref=sample)
+from functools import partial
 
 
-def edit_distance_utility(sample_1, sample_2, reduce_type="mean"):
+def get_sacre_score_fn(sacre_metric):
+    return partial(sacre_score, sacre_metric=sacre_metric)
+
+
+def sacre_score(hyp, ref, sacre_metric=None):
+    return sacre_metric.sentence_score(hyp, [ref]).score
+
+
+def get_utility_fn(utility_type):
+    if utility_type == "editdistance":
+        utility_fn = editdistance.eval
+    elif utility_type == "beer":
+        from mbr_nmt.utility import parse_utility
+        utility_fn = parse_utility('beer', lang='en')
+    elif utility_type == "meteor":
+        from mbr_nmt.utility import parse_utility
+        utility_fn = parse_utility('meteor', lang='en')
+    else:
+        if sacrebleu.__version__ == '2.0.0':
+
+            if utility_type == "bleu":
+                bleu = BLEU(smooth_method='exp',
+                            effective_order=True)
+                utility_fn = get_sacre_score_fn(bleu)  # lambda hyp, ref: bleu.sentence_score(hyp, [ref]).score
+            elif utility_type in ["chrf", "chrf++"]:
+                word_order = 2 if utility_type == "chrf++" else 0
+                chrf = CHRF(word_order=word_order, )
+                utility_fn = get_sacre_score_fn(chrf)
+
+        else:
+            if utility_type == "bleu":
+                utility_fn = lambda hyp, ref: sacrebleu.sentence_bleu(hyp, [ref]).score
+            elif utility_type == "chrf":
+                utility_fn = lambda hyp, ref: sacrebleu.sentence_chrf(hyp, [ref]).score
+            elif utility_type == "chrf++":
+                raise Exception("Cannot use chrf++ without sacrebleu of verion 2.0.0")
+    return utility_fn
+
+
+def get_utility_of_samples(utility_type, sample_1, sample_2, reduce_type="mean", save_utility_per_sentence=False):
     """
     Compute mean (by batch) or total edit distance utility between two samples shaped as BxL.
     """
+    utility_fn = get_utility_fn(utility_type)
     # iterate over batches in sample
-    total_utility = sum([editdistance.eval(batch_1, batch_2) for batch_1, batch_2 in zip(sample_1, sample_2)])
+    total_utility = [utility_fn(batch_1, batch_2) for batch_1, batch_2 in zip(sample_1, sample_2)]
     if reduce_type == "mean":
         # compute mean sample utility
-        return total_utility / len(sample_1)
+        reduced_utility = sum(total_utility) / len(sample_1)
     elif reduce_type == "sum":
-        return total_utility
+        reduced_utility = sum(total_utility)
+    # if we will not be saving utility, do not return it.
+    if save_utility_per_sentence == False:
+        total_utility = None
+    return reduced_utility, total_utility
 
 
-def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="editdistance", return_types=("h",),
-                 need_grad=False, compute_log_probs=False, encoded_batch=None):
-    set_of_possible_returns = {"h", "samples", "utilities", "log_probabilities"}
+def prepare_encoded_batch_for_sampling(encoded_batch, num_samples):
+    try:
+        encoded_batch[0] = encoded_batch[0].repeat(num_samples, 1, 1)
+    except:
+        pass
+    try:
+        encoded_batch[1] = encoded_batch[1].repeat(num_samples, 1, 1)
+    except:
+        pass
+    return encoded_batch
+
+
+def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="editdistance",
+                 utility_type="editdistance", utility_fn=None, return_types=("h",),
+                 need_grad=False, compute_log_probs=False, encoded_batch=None, small_test_run=False,
+                 rank=None, world_size=1, samples_raw=None):
+    set_of_possible_returns = {"h", "samples", "samples_raw", "utilities", "log_probabilities",
+                               "mean_batch_expected_uility_h", "batch"}
     assert len(set(return_types) - set_of_possible_returns) == 0, f"You have specified wrong return types. " \
-                                                                  f"Make sure it's one (or more) out of {set_of_possible_returns}"
+                                                                  f"Make sure it's one (or more) out of" \
+                                                                  f" {set_of_possible_returns}"
     # sample S samples of translation y|x  using  run_batch
 
-    # copy batch num_samples times to sample
+    # repeat along batch dimension num_samples times to simulate sampling
     batch_size = batch.src.shape[0]
-    batch.src = batch.src.repeat(num_samples, 1)
-    batch.src_mask = batch.src_mask.repeat(num_samples, 1, 1)
-    batch.trg_mask = batch.trg_mask.repeat(num_samples, 1, 1)
-    logger.info(f" batch device in mbr {batch.src.device}")
-    # [B*SxL, B*S]
-    samples, log_probs = run_batch(model, batch, max_output_length=max_output_length, beam_size=1, beam_alpha=1,
-                                   sample=True, need_grad=need_grad, compute_log_probs=compute_log_probs,
-                                   encoded_batch=encoded_batch)
+    batch = repeat_batch(batch, num_samples)
+    if samples_raw is None:
+        if encoded_batch is not None and encoded_batch[0] is not None:
+            encoded_batch = prepare_encoded_batch_for_sampling(encoded_batch, num_samples)
+        else:
+            encoded_batch = None
+        # [B*SxL, B*S]
+        samples_raw, log_probs = run_batch(model, batch, max_output_length=max_output_length, beam_size=1,
+                                           beam_alpha=1,
+                                           sample=True, need_grad=need_grad, compute_log_probs=compute_log_probs,
+                                           encoded_batch=encoded_batch)
+    else:
+        assert samples_raw.shape[0] == batch_size * num_samples, \
+            f"Something is wrong with sample shape, it must be [B*S, L]," \
+            f" it is currently [{samples_raw.shape[0]}, {samples_raw.shape[1]}]," \
+            f" while B is {batch_size} and S is {num_samples}"
+        log_probs = None
+        # if rank is not None:
+    # logger.info(f"got samples rank {rank}")
 
     # [BxSxL] transpose is needed to make sure that it's actually split by batches
-    samples = samples.reshape(num_samples, batch_size, -1).transpose((1, 0, 2))
-    if "log_probabilities" in return_types:
+    samples = samples_raw.reshape(num_samples, batch_size, -1).transpose((1, 0, 2))
+    if "log_probabilities" in return_types and compute_log_probs:
         # [BxS]
         log_probs = log_probs.reshape(batch_size, num_samples)
 
     if mbr_type == "editdistance":
         # define utility function
-        utility_fn = editdistance.eval
+        if utility_fn is None:
+            utility_fn = get_utility_fn(utility_type)
 
-        # transform indices to str
-        decoded_samples = [
-            [' '.join(sample) for sample in model.trg_vocab.arrays_to_sentences(arrays=batch,
-                                                                                cut_at_eos=True)] for batch in samples]
+        # transform indices to str [BxS] if len(sample)!=0 else "the"
+        decoded_samples = [[bpe_postprocess(' '.join(sample) + '<\s>') for sample in
+                            model.trg_vocab.arrays_to_sentences(arrays=batch, cut_at_eos=True)] for batch in samples]
+
         # initialise utility matrix [BxSxS]
-        U = torch.zeros([batch_size, num_samples, num_samples], dtype=torch.float) + 1e-10
-        # combination of all samples (since utility is symmetrical, we need only AB and not BA samples) [BxC]
-        batch_combinations_of_samples = [itertools.combinations(batch_samples, r=2) for batch_samples in
-                                         decoded_samples]
-        # computing utility of the samples [BxS]
-        utilities = torch.tensor([list(itertools.starmap(utility_fn, combinations_of_samples)) for
-                                  combinations_of_samples in batch_combinations_of_samples]).to(torch.float)
-        # lower triangular and upper indices of the matrix, below the diagonal, since distance(A,A) = 0
-        tril_indices = torch.tril_indices(row=num_samples, col=num_samples, offset=-1)
-        triu_indices = torch.triu_indices(row=num_samples, col=num_samples, offset=1)
-        # setting the values to the matrix [BxSxS]
-        U[:, tril_indices[0], tril_indices[1]] = utilities
-        U[:, triu_indices[0], triu_indices[1]] = utilities
+        # if symmetrical utility, do this
+        if utility_type == "editdistance":
+            U = torch.zeros([batch_size, num_samples, num_samples], dtype=torch.float) + 1e-10
+            # combination of all samples (since utility is symmetrical, we need only AB and not BA samples) [BxC]
+            batch_combinations_of_samples = [itertools.combinations(batch_samples, r=2) for batch_samples in
+                                             decoded_samples]
+            # computing utility of the samples [BxC]
+            utilities = torch.tensor([list(itertools.starmap(utility_fn, combinations_of_samples)) for
+                                      combinations_of_samples in batch_combinations_of_samples], dtype=torch.float)
+
+            # lower triangular and upper indices of the matrix, below the diagonal, since distance(A,A) = 0
+            tril_indices = torch.tril_indices(row=num_samples, col=num_samples, offset=-1)
+            triu_indices = torch.triu_indices(row=num_samples, col=num_samples, offset=1)
+            # setting the values to the matrix [BxSxS]
+            U[:, tril_indices[0], tril_indices[1]] = utilities
+            U[:, triu_indices[0], triu_indices[1]] = utilities
+        else:
+            # permutations of all samples [Bx(S^2)]
+            batch_combinations_of_samples = [list(itertools.product(batch_samples, repeat=2)) for batch_samples in
+                                             decoded_samples]
+
+            # # computing utility of the samples [Bx(S^2)]
+            # [B*S^2]
+            # multiprocessing sacre utilities
+            if False and utility_type != "beer":
+                chunked_batches_and_utility_fns = [(chunked_batches[i], utility_fn[i]) for i in
+                                                   range(len(chunked_batches))]
+                with mp.Pool(cpus) as p:
+                    utilities = p.map(eval_utility_chunked_batch, chunked_batches_and_utility_fns)
+                utilities = torch.tensor([u for sublist in utilities for u in sublist], dtype=torch.float)
+
+            elif type(utility_fn) != list:
+
+                utilities = torch.tensor([list(itertools.starmap(utility_fn, combinations_of_samples)) for
+                                          combinations_of_samples in batch_combinations_of_samples],
+                                         dtype=torch.float)
+            # multithreading
+            elif type(utility_fn) == list:
+                # number of threads is number of cpus per gpu
+                cpus = mp.cpu_count() // world_size
+                # number of examples per thread
+                num_per_cpu = int(np.ceil(len(batch_combinations_of_samples) / cpus))
+                # chunk the batch for each thread and combine with specififc utility process
+                chunked_batches = [batch_combinations_of_samples[i:i + num_per_cpu]
+                                   for i in range(0, len(batch_combinations_of_samples), num_per_cpu)]
+
+                # add the utility fn next to the batches
+                chunked_batches_and_utility_fns = [(chunked_batches[i], utility_fn[i]) for i in
+                                                   range(len(chunked_batches))]
+
+                # multithread
+                with ThreadPool(cpus) as p:
+                    utilities = p.map(eval_utility_chunked_batch, chunked_batches_and_utility_fns)
+                # flatten the list and wrap in a tensor
+                utilities = torch.tensor([u for sublist in utilities for u in sublist], dtype=torch.float)
+
+            # setting the values to the matrix [BxSxS]
+            U = utilities.reshape(batch_size, num_samples, num_samples)
+        # if rank is not None:
+        #     logger.info(f"computed utility rank {rank}")
         # compute utility per candidate [BxS]
         expected_uility = torch.mean(U, dim=-1)
-        # get argmin_c of sum^S u(samples, c) (min because we want less edit distance) [B]
-        best_idx = torch.argmin(expected_uility, dim=-1)
+        # get argmin_c or argmax_c of sum^S u(samples, c) (min because we want less edit distance) [B]
+        if utility_type == "editdistance":
+            best_idx = torch.argmin(expected_uility, dim=-1)
+        else:
+            best_idx = torch.argmax(expected_uility, dim=-1)
         # return things that you want to return
-        return_list = []
+        return_dict = {}
         if "h" in return_types:
             # get prediction with best samples
             prediction = samples[np.arange(batch_size), best_idx.numpy()]
-            return_list.append(prediction)
+            return_dict['h'] = prediction
         if "samples" in return_types:
-            return_list.append(samples)
+            return_dict['samples'] = samples
+        if "samples_raw" in return_types:
+            return_dict['samples_raw'] = samples_raw
         if "utilities" in return_types:
             best_idx = best_idx.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, num_samples)
-            u_h = U.gather(1, best_idx).squeeze(-1)
+            # [BxS]
+            u_h = U.gather(1, best_idx).squeeze(1)
+            # print("u_h", u_h)
             u_h = u_h + 1e-10
-            return_list.append(u_h)
+            return_dict['utilities'] = u_h
         if "log_probabilities" in return_types:
-            return_list.append(log_probs)
-        return return_list
+            return_dict['log_probabilities'] = log_probs
+        if "batch" in return_types:
+            return_dict['batch'] = batch
+        if "mean_batch_expected_uility_h" in return_types:
+            # logger.info(f"best_idx {best_idx} expected_utility shape {expected_uility.shape}")
+            return_dict['mean_batch_expected_uility_h'] = torch.mean(expected_uility[:, best_idx].detach())
+        return return_dict
 
 
     else:
@@ -682,58 +957,49 @@ def mbr_decoding(model, batch, max_output_length=100, num_samples=10, mbr_type="
         return prediction
 
 
-def get_utility_per_sentence(utility, hyp_samples, ref_samples):
-    # todo
-    raise NotImplementedError
+# def eval_utility(*args):
+#     # print(os.listdir())
+#     utility_fn = get_utility_fn("beer")
+#     utility =  utility_fn(*args)
+#     utility_fn.proc.kill()
+#     return utility
+
+# calling the call_batch function
+# def batch_call_utility_fn(batch_combinations_of_samples, utility_fn):
+#     hyp_ref_batches = [zip(*batch) for batch in batch_combinations_of_samples]
+#     hyp_batch, ref_batch = (), ()
+#     for h, r in hyp_ref_batches:
+#         hyp_batch += h
+#         ref_batch += r
+#     # logger.info(f"len {len(hyp_batch)}, {len(ref_batch)}, batch size {batch_size}, num samples{num_samples}")
+#     utilities = torch.tensor([utility_fn.call_batch(hyp_batch, ref_batch)], dtype=torch.float)
+
+# eval utility of a single batch
+def eval_utility_batch(batch, utility_fn):
+    utility = [utility_fn(*combination_of_samples) for combination_of_samples in batch]
+    return utility
+
+
+def eval_utility_chunked_batch(batches_and_fn):
+    batches, utility_fn = batches_and_fn
+    print(len(batches), flush=True)
+
+    utility = [list(itertools.starmap(utility_fn, combinations_of_samples)) for
+               combinations_of_samples in batches]
+    return utility
+
+
+# eval utility of multiple batches
+#     with mp.Pool(cpus) as p:
+#         utilities = p.map(eval_utility_batches, chunked_batch_combinations_of_samples)
+
+# def eval_utility_batches(batches):
+#     utility_fn = get_utility_fn("beer")
+#     utility = [list(itertools.starmap(utility_fn, combinations_of_samples)) for
+#                combinations_of_samples in batches]
+#     # utility = [utility_fn(*combination_of_samples) for combination_of_samples in batch]
+#     return utility
 
 
 if __name__ == "__main__":
     pass
-
-    # # SxBxL
-    # samples = samples.reshape(num_samples, batch_size, -1)
-    #
-    # # if "log_probabilities" in return_types:
-    # #     log_probs = torch.stack(log_probs)
-    #
-    # if mbr_type == "editdistance":
-    #     # define utility function
-    #     utility_fn = edit_distance_utility
-    #
-    #     # transform indices to str
-    #     decoded_samples = [
-    #         [' '.join(batch) for batch in model.trg_vocab.arrays_to_sentences(arrays=sample,
-    #                                                                           cut_at_eos=True)] for sample in samples]
-    #     # print(decoded_samples[0])
-    #
-    #     # initialise utility matrix
-    #     U = torch.zeros([num_samples, num_samples], dtype=torch.float) + 1e-10
-    #     # combination of all samples (since utility is symmetrical, we need only AB and not BA samples)
-    #     combinations_of_samples = itertools.combinations(decoded_samples, r=2)
-    #     # computing utility of the samples
-    #     utilities = torch.tensor(list(itertools.starmap(utility_fn, combinations_of_samples))).to(torch.float)
-    #     # lower triangular and upper indices of the matrix, below the diagonal, since distance(A,A) = 0
-    #     tril_indices = torch.tril_indices(row=num_samples, col=num_samples, offset=-1)
-    #     triu_indices = torch.triu_indices(row=num_samples, col=num_samples, offset=1)
-    #     # setting the values to the matrix
-    #     U[tril_indices[0], tril_indices[1]] = utilities
-    #     U[triu_indices[0], triu_indices[1]] = utilities
-    #     # compute utility per candidate
-    #     expected_uility = torch.mean(U, dim=1)
-    #     # print("utilities", utilities)
-    #     # print("U matrix", U)
-    #     # print("expected utility", expected_uility)
-    #     # get argmin_c of sum^S u(samples, c) (min because we want less edit distance)
-    #     best_idx = torch.argmin(expected_uility)
-    #     prediction = samples[best_idx]
-    #     # return things that you want to return
-    #     return_list = []
-    #     if "h" in return_types:
-    #         return_list.append(prediction)
-    #     if "samples" in return_types:
-    #         return_list.append(samples)
-    #     if "utilities" in return_types:
-    #         return_list.append(U[best_idx])
-    #     if "log_probabilities" in return_types:
-    #         return_list.append(log_probs)
-    #     return return_list

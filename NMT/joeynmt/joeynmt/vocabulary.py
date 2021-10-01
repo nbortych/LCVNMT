@@ -6,8 +6,9 @@ Vocabulary module
 from collections import defaultdict, Counter
 from typing import List
 import numpy as np
-
-from torchtext.data import Dataset
+import torchtext
+from torchtext.legacy.data import Dataset
+import pickle
 
 from joeynmt.constants import UNK_TOKEN, DEFAULT_UNK_ID, \
     EOS_TOKEN, BOS_TOKEN, PAD_TOKEN
@@ -16,7 +17,7 @@ from joeynmt.constants import UNK_TOKEN, DEFAULT_UNK_ID, \
 class Vocabulary:
     """ Vocabulary represents mapping between tokens and indices. """
 
-    def __init__(self, tokens: List[str] = None, file: str = None) -> None:
+    def __init__(self, tokens: List[str] = None, file: str = None, pickle_file: str = None) -> None:
         """
         Create vocabulary from list of tokens or file.
 
@@ -34,10 +35,14 @@ class Vocabulary:
 
         self.stoi = defaultdict(DEFAULT_UNK_ID)
         self.itos = []
+
         if tokens is not None:
             self._from_list(tokens)
+        elif pickle_file is not None:
+            self._from_pickle(pickle_file)
         elif file is not None:
             self._from_file(file)
+
 
     def _from_list(self, tokens: List[str] = None) -> None:
         """
@@ -47,8 +52,22 @@ class Vocabulary:
 
         :param tokens: list of tokens
         """
-        self.add_tokens(tokens=self.specials+tokens)
+        self.add_tokens(tokens=self.specials + tokens)
         assert len(self.stoi) == len(self.itos)
+
+    def _from_pickle(self, pickle_file: str) -> None:
+        """
+        Make vocabulary from contents of a pickle file.
+        File format: .pickle
+
+        :param file: path to file where the vocabulary is loaded from
+        """
+        with open(pickle_file, 'rb') as dictionary_pickle_file:
+            dictionary_pickle = pickle.load(dictionary_pickle_file)
+
+        self.itos = dictionary_pickle['itos']
+        self.stoi = dictionary_pickle['stoi']
+
 
     def _from_file(self, file: str) -> None:
         """
@@ -75,6 +94,11 @@ class Vocabulary:
         with open(file, "w") as open_file:
             for t in self.itos:
                 open_file.write("{}\n".format(t))
+
+    def to_pickle(self, pickle_file):
+        vocab_dict = {'stoi': self.stoi.copy(), 'itos': self.itos.copy()}
+        with open(pickle_file, 'wb') as vocab_file:
+            pickle.dump(vocab_dict, vocab_file, protocol=pickle.HIGHEST_PROTOCOL)
 
     def add_tokens(self, tokens: List[str]) -> None:
         """
@@ -123,7 +147,7 @@ class Vocabulary:
         return sentence
 
     def arrays_to_sentences(self, arrays: np.array, cut_at_eos=True,
-                            skip_pad=True, join_sentence = False) -> List[List[str]]:
+                            skip_pad=True, join_sentence=False) -> List[List[str]]:
         """
         Convert multiple arrays containing sequences of token IDs to their
         sentences, optionally cutting them off at the end-of-sequence token.
@@ -141,13 +165,11 @@ class Vocabulary:
         return sentences
 
 
-def build_vocab(field: str, max_size: int, min_freq: int, dataset: Dataset,
-                vocab_file: str = None) -> Vocabulary:
+def build_vocab(language: str, max_size: int, min_freq: int, dataset: Dataset,
+                vocab_file: str = None, pickle_file = None) -> Vocabulary:
     """
-    Builds vocabulary for a torchtext `field` from given`dataset` or
-    `vocab_file`.
+    Builds vocabulary for a given`dataset` or `vocab_file`.
 
-    :param field: attribute e.g. "src"
     :param max_size: maximum size of vocabulary
     :param min_freq: minimum frequency for an item to be included
     :param dataset: dataset to load data for field from
@@ -156,9 +178,9 @@ def build_vocab(field: str, max_size: int, min_freq: int, dataset: Dataset,
     :return: Vocabulary created from either `dataset` or `vocab_file`
     """
 
-    if vocab_file is not None:
+    if vocab_file is not None or pickle_file is not None:
         # load it from file
-        vocab = Vocabulary(file=vocab_file)
+        vocab = Vocabulary(file=vocab_file, pickle_file = pickle_file)
     else:
         # create newly
         def filter_min(counter: Counter, min_freq: int):
@@ -178,11 +200,11 @@ def build_vocab(field: str, max_size: int, min_freq: int, dataset: Dataset,
             return vocab_tokens
 
         tokens = []
-        for i in dataset.examples:
-            if field == "src":
-                tokens.extend(i.src)
-            elif field == "trg":
-                tokens.extend(i.trg)
+        for src, _, trg, _ in dataset:
+            if language == "src":
+                tokens.extend(src)
+            elif language == "trg":
+                tokens.extend(trg)
 
         counter = Counter(tokens)
         if min_freq > -1:

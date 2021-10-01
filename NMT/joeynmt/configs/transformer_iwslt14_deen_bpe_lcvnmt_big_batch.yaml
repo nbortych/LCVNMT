@@ -1,0 +1,159 @@
+name: "iwslt14-deen-bpe-transformer"
+
+data:
+    src: "de"
+    trg: "en"
+    train: "test/data/iwslt14/train.bpe.32000"
+    dev: "test/data/iwslt14/valid.bpe.32000"
+    test: "test/data/iwslt14/test.bpe.32000"
+    level: "bpe"
+    lowercase: True
+    max_sent_length: 62
+    src_vocab: "test/data/iwslt14/vocab.txt"
+    trg_vocab: "test/data/iwslt14/vocab.txt"
+    use_pickled_vocab: True
+    src_vocab_pickle: "test/data/iwslt14/vocab.pickle"
+    trg_vocab_pickle: "test/data/iwslt14/vocab.pickle"
+
+testing:
+    beam_size: 1
+    alpha: 1.0
+    # LC-NMT specific things
+    small_test_run: False
+    mbr: True
+    mbr_type: "editdistance"
+    utility: "chrf"
+    num_samples: 10
+    save_utility_per_sentence: True
+    all_decoding_types: True
+    multi_utility: True
+    only_test: True
+
+training:
+#    load_model: "models/iwslt14_deen_bpe_transformer_lcvnmt_1_cp/latest.ckpt" # checkpoint
+#    load_model: "models/iwslt14_deen_bpe_transformer_bnn_3_lr0/best.ckpt" #  based on best bnn
+    load_model: "models/iwslt14_deen_bpe_transformer_bnn_3_lr0_pretrain/best.ckpt" #  based on pretrained bnn
+#    load_model: "models/iwslt14_deen_bpe_transformer_precalibration_1/best.ckpt" # checkpoint based on baseline pretrained
+    reset_best_ckpt: True
+    reset_scheduler: True
+    reset_optimizer: True
+    random_seed: 42
+    optimizer: "adam"
+    normalization: "tokens"
+    adam_betas: [0.9, 0.999]
+    scheduling: "plateau"
+    patience: 10
+    decrease_factor: 0.7
+    loss: "crossentropy"
+    learning_rate: 0.000003
+    learning_rate_min: 0.00000001
+    weight_decay: 0.0001
+    label_smoothing: 0
+    batch_size: 10
+    batch_multiplier: 12
+#    eval_batch_size: 64
+    batch_type: "sentence"
+    early_stopping_metric: "utility"
+    epochs: 2
+    validation_freq: 10000
+    logging_freq: 500
+    eval_metric: ''
+    # 0 - lcvnmt based on baseline, 1 based on best bnn,2 form scratch,  3 based on pretrained bnn
+#    model_dir: "models/iwslt14_deen_bpe_transformer_lcvnmt_1_cp1"
+    model_dir: "models/iwslt14_deen_bpe_transformer_lcvnmt_big_batch"
+    overwrite: False
+    shuffle: True
+    use_cuda: True
+    max_output_length: 50 #50
+    dynamic_max_sample: True
+    sampling_max_buffer: 5
+    print_valid_sents: [0, 1, 2, 3, 4]
+    keep_last_ckpts: 5
+    # LC-NMT specific things
+    track_mbr: True
+    mbr_type: "editdistance"
+    utility: "chrf"
+    small_test_run: False
+    utility_regularising: True
+    utility_alpha: 0.1
+    num_samples: 10
+    ddp: True
+    num_nodes: 1
+    distributed_batch_sampler: True
+    mean_baseline: True
+    vimco_baseline: True
+    wandb: True
+    early_stopping: True
+    validation_stopping: True
+    early_stopping_patience: 18
+    validation_precompute_batch: True
+    steps_per_batch:  1
+    bnn: True
+
+
+##
+#model:
+#    initializer: "uniform"
+#    init_weight: 0.1
+#    embed_initializer: "uniform"
+#    embed_init_weight: 0.1
+#    bias_initializer: "uniform"
+#    bias_init_weight: 0.1
+#    init_rnn_orthogonal: False
+#    lstm_forget_gate: 0.
+#    encoder:
+#        rnn_type: "lstm"
+#        embeddings:
+#            embedding_dim: 512
+#            scale: False
+#        hidden_size: 512
+#        bidirectional: True
+#        dropout: 0.2
+#        num_layers: 1
+#    decoder:
+#        rnn_type: "lstm"
+#        embeddings:
+#            embedding_dim: 512
+#            scale: False
+#        emb_scale: False
+#        hidden_size: 512
+#        dropout: 0.2
+#        hidden_dropout: 0.2
+#        num_layers: 2
+#        input_feeding: True
+#        init_hidden: "zero"
+#        attention: "luong"
+
+##########################################################
+model:
+    initializer: "xavier"
+    embed_initializer: "xavier"
+    embed_init_gain: 1.0
+    init_gain: 1.0
+    bias_initializer: "zeros"
+    tied_embeddings: True
+    tied_softmax: True
+    encoder:
+        type: "transformer"
+        num_layers: 6
+        num_heads: 4
+        embeddings:
+            embedding_dim: 256
+            scale: True
+            dropout: 0.
+        # typically ff_size = 4 x hidden_size
+        hidden_size: 256
+        ff_size: 1024
+        dropout: 0.3
+    decoder:
+        type: "transformer"
+        num_layers: 6
+        num_heads: 4
+        embeddings:
+            embedding_dim: 256
+            scale: True
+            dropout: 0.
+        # typically ff_size = 4 x hidden_size
+        hidden_size: 256
+        ff_size: 1024
+        dropout: 0.3

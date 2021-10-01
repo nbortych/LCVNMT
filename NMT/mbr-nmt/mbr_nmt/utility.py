@@ -5,7 +5,8 @@ import warnings
 import mbr_nmt
 import sacrebleu
 from itertools import combinations
-
+import numpy as np
+# import multiprocessing as mp
 
 def parse_utility(string, lang=None):
     if string == "unigram-precision":
@@ -166,6 +167,7 @@ class BEER:
         :param hyp: hypothesis, list of tokens (strings).
         :param ref: reference, list of tokens (strings).
         """
+        if len(hyp) == 0 or len(ref) == 0: return 0.
         self.lock.acquire()
         self.proc.stdin.write("EVAL ||| {} ||| {}\n".format(" ".join(hyp), " ".join(ref)).encode("utf-8"))
         self.proc.stdin.flush()
@@ -173,6 +175,18 @@ class BEER:
         self.lock.release()
         return beer
 
+    def call_batch(self, hyp_batch, ref_batch):
+        """
+            :param hyp: hypothesis, list of tokens (strings).
+            :param ref: reference, list of tokens (strings).
+            """
+        self.lock.acquire()
+        for hyp, ref in zip(hyp_batch, ref_batch):
+            self.proc.stdin.write("EVAL ||| {} ||| {}\n".format(" ".join(hyp), " ".join(ref)).encode("utf-8"))
+        self.proc.stdin.flush()
+        beer = [float(self.proc.stdout.readline()) for i in range(len(hyp_batch))]
+        self.lock.release()
+        return beer
     def __del__(self):
         """
         Make sure to close the subprocess when no longer needed.

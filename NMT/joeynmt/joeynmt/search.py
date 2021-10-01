@@ -14,6 +14,7 @@ from joeynmt.helpers import tile
 
 __all__ = ["greedy", "transformer_greedy", "beam_search", "run_batch", "sample"]
 
+from torch.nn.functional import  dropout
 
 def greedy(src_mask: Tensor, max_output_length: int, model: Model,
            encoder_output: Tensor, encoder_hidden: Tensor, sample: bool, need_grad=False,
@@ -45,7 +46,7 @@ def greedy(src_mask: Tensor, max_output_length: int, model: Model,
         src_mask, max_output_length, model, encoder_output, encoder_hidden, sample, need_grad=need_grad,
         compute_log_probs=compute_log_probs)
 
-
+# todo make like transformer: add compute log probs and need grad
 def recurrent_greedy(
         src_mask: Tensor, max_output_length: int, model: Model,
         encoder_output: Tensor, encoder_hidden: Tensor, sample: bool = False, need_grad=False,
@@ -90,10 +91,17 @@ def recurrent_greedy(
             # logits: batch x time=1 x vocab (logits)
 
         # greedy decoding: choose arg max over vocabulary in each step
-        next_word = torch.argmax(logits, dim=-1)  # batch x time=1
+        if not sample:
+            next_word = torch.argmax(logits, dim=-1)  # batch x time=1
+        else:
+            py_x = Categorical(logits=logits)
+            next_word = py_x.sample()
+            next_word = next_word.data
         output.append(next_word.squeeze(1).detach().cpu().numpy())
         prev_y = next_word
         attention_scores.append(att_probs.squeeze(1).detach().cpu().numpy())
+        if compute_log_probs:
+            log_prob_of_sentence += log_prob_of_a_word(logits, next_word)
         # batch, max_src_length
 
         # check if previous symbol was <eos>
@@ -107,6 +115,12 @@ def recurrent_greedy(
     stacked_attention_scores = np.stack(attention_scores, axis=1)
     return stacked_output, stacked_attention_scores
 
+def log_prob_of_a_word(logits, next_word):
+    # transform logits into log probs
+    log_probs = F.log_softmax(logits, dim=-1)[0]
+    # get the log p(y|...)
+    log_prob_of_word = log_probs[next_word]
+    return log_prob_of_word
 
 # pylint: disable=unused-argument
 def transformer_greedy(
@@ -167,12 +181,7 @@ def transformer_greedy(
             next_word = next_word.data
             ys = torch.cat([ys, next_word.unsqueeze(-1)], dim=1)
             if compute_log_probs:
-                # transform logits into log probs
-                log_probs = F.log_softmax(logits, dim=-1)[0]
-                # get the log p(y|...)
-                log_prob_of_word = log_probs[next_word]
-                # add to the sentence log_probability
-                log_prob_of_sentence += log_prob_of_word
+                log_prob_of_sentence += log_prob_of_a_word(logits, next_word)
         # check if previous symbol was <eos>
         is_eos = torch.eq(next_word, eos_index)
         finished += is_eos

@@ -11,17 +11,28 @@ data:
   max_sent_length: 62
   src_vocab: "test/data/iwslt14/vocab.txt"
   trg_vocab: "test/data/iwslt14/vocab.txt"
+  use_pickled_vocab: True
+  src_vocab_pickle: "test/data/iwslt14/vocab.pickle"
+  trg_vocab_pickle: "test/data/iwslt14/vocab.pickle"
 
 testing:
   beam_size: 1
   alpha: 1.0
+  # LCV-NMT specific things
   small_test_run: True
   mbr: True
   mbr_type: "editdistance"
-  utility: "editdistance"
-  num_samples: 3
+  utility: "chrf"
+  num_samples: 10
+  save_utility_per_sentence: True
+  all_decoding_types: False
+  multi_utility: True
+  only_test: True
+  multi_mbr: True
+
 
 training:
+#  load_model: "models/iwslt14-deen-bpe-transformer_test/3.ckpt"
   random_seed: 42
   optimizer: "adam"
   normalization: "tokens"
@@ -34,30 +45,105 @@ training:
   learning_rate_min: 0.00000001
   weight_decay: 0.0
   label_smoothing: 0
-  batch_size: 256
-  batch_type: "token"
-  early_stopping_metric: "eval_metric"
-  epochs: 1
-  validation_freq: 1000
-  logging_freq: 100
-  eval_metric: "bleu"
-  model_dir: "models/iwslt14-deen-bpe-transformer_test"
+  batch_size: 10
+  batch_type: "sentence"
+  early_stopping_metric: "utility"
+  epochs: 3
+  validation_freq: 100
+  logging_freq: 1
+  eval_metric: ""
+  model_dir: "models/iwslt14-deen-bpe-transformer_test_9"#_checkpoint"
   overwrite: True
   shuffle: True
   use_cuda: True
-  max_output_length: 10
+  max_output_length: 5
+#  dynamic_max_sample: True
+#  sampling_max_buffer: 5
   print_valid_sents: [ 0, 1, 2, 3, 4 ]
   save_latest_ckpt: True
   keep_last_ckpts: 5
-
+ # LC-NMT specific things
   track_mbr: True
   mbr_type: "editdistance"
-  utility: "editdistance"
-  small_test_run: False
+  utility: "chrf"
+  small_test_run: True
   utility_regularising: True
-  utility_alpha: 0.1
-  num_samples: 2
-  ddp: False
+  utility_alpha: 1
+  num_samples: 10
+  regulariser_utility_threshold: 0.0
+  regulariser_epoch_threshold: 0
+  ddp: True
+  num_nodes: 1
+  distributed_batch_sampler: True
+  mean_baseline: True
+  vimco_baseline: True
+  wandb: True
+  early_stopping: True
+  validation_stopping: False
+  early_stopping_patience: 10
+  validation_precompute_batch: False
+  steps_per_batch: 5
+  bnn: False
+#
+#model:
+#  initializer: "xavier"
+#  embed_initializer: "xavier"
+#  embed_init_gain: 1.0
+#  init_gain: 1.0
+#  bias_initializer: "zeros"
+#  tied_embeddings: True
+#  tied_softmax: True
+#  encoder:
+#    type: "transformer"
+#    num_layers: 6
+#    num_heads: 4
+#    embeddings:
+#      embedding_dim: 256
+#      scale: True
+#      dropout: 0.
+#    # typically ff_size = 4 x hidden_size
+#    hidden_size: 256
+#    ff_size: 1024
+#    dropout: 0.3
+#  decoder:
+#    type: "transformer"
+#    num_layers: 6
+#    num_heads: 4
+#    embeddings:
+#      embedding_dim: 256
+#      scale: True
+#      dropout: 0.
+#    # typically ff_size = 4 x hidden_size
+#    hidden_size: 256
+#    ff_size: 1024
+#    dropout: 0.3
+
+###################################
+#model:
+#  encoder:
+#    rnn_type: "lstm"
+#    embeddings:
+#      embedding_dim: 128
+#      scale: False
+#    hidden_size: 128
+#    bidirectional: True
+#    dropout: 0.2
+#    hidden_dropout: 0.2
+#    num_layers: 1
+#  decoder:
+#    rnn_type: "lstm"
+#    embeddings:
+#      embedding_dim: 128
+#      scale: False
+#    emb_scale: False
+#    hidden_size: 128
+#    dropout: 0.2
+#    hidden_dropout: 0.2
+#    num_layers: 1
+#    input_feeding: True
+#    init_hidden: "last"
+#    attention: "luong"
+##############################################################################
 model:
   initializer: "xavier"
   embed_initializer: "xavier"

@@ -32,7 +32,8 @@ class Model(nn.Module):
                  src_embed: Embeddings,
                  trg_embed: Embeddings,
                  src_vocab: Vocabulary,
-                 trg_vocab: Vocabulary) -> None:
+                 trg_vocab: Vocabulary,
+                 regulariser_only = False) -> None:
         """
         Create a new encoder-decoder model
 
@@ -55,9 +56,7 @@ class Model(nn.Module):
         self.pad_index = self.trg_vocab.stoi[PAD_TOKEN]
         self.eos_index = self.trg_vocab.stoi[EOS_TOKEN]
         self._loss_function = None  # set by the TrainManager
-        self._utility_alpha = 1  # set by the TrainManager
-        self._num_samples = 10  # set by the TrainManager
-        self._max_output_length = None  # set by the TrainManager
+        self.regulariser_only = regulariser_only
 
     @property
     def loss_function(self):
@@ -78,17 +77,13 @@ class Model(nn.Module):
 
         :param return_type: one of {"loss", "encode", "decode"}
         """
-        # print(f"Running model with {return_type}")
-
         if return_type is None:
             raise ValueError("Please specify return_type: "
                              "{`loss`, `encode`, `decode`}.")
 
         return_tuple = (None, None, None, None)
-        if return_type == "loss":
+        if return_type == "loss" or return_type == "log_prob":
             assert self.loss_function is not None
-            # logger.info(f"Batch shape {kwargs['src'].shape}, src mask {kwargs['src_mask'].shape}, src length {kwargs['src_length']}")
-            # out, hidden, _, _ = self._encode_decode(**kwargs)
             # encode and decode explicitly to save encoded for sampling
             encoder_output, encoder_hidden = self._encode(**kwargs)
             unroll_steps = kwargs['trg_input'].size(1)
@@ -97,35 +92,43 @@ class Model(nn.Module):
 
             # compute log probs
             log_probs = F.log_softmax(out, dim=-1)
+            # logger.info(f"log probs shape {log_probs.shape}")
             # compute batch loss
-            batch_loss = self.loss_function(log_probs, kwargs["trg"])
-            utility_reg = kwargs.get("utility_regularising", False)  # self.loss_function.utility_regularising
+            if return_type == "loss":
+                if self.regulariser_only:
+                    batch_loss = torch.tensor(0., device=kwargs['trg_input'].device)
+                else:
+                    batch_loss = self.loss_function(log_probs, kwargs["trg"])
+            elif return_type == "log_prob":
+                batch_loss = self.loss_function(log_probs, kwargs["trg"], reduce=False)
+            utility_reg = kwargs.get("utility_regularising", False)
             if utility_reg:
-                # reinforce: \delta E = E_{p(y|\theta, x)} [log u(y,h) * \delta log p (y|\theta, x)]
-                from joeynmt.prediction import mbr_decoding
-                # compute mbr, get utility(samples, h)
-                u_h, sample_log_probs = mbr_decoding(self, kwargs["batch"], max_output_length=self._max_output_length,
-                                                     num_samples=self._num_samples,
-                                                     mbr_type="editdistance",
-                                                     return_types=("utilities", "log_probabilities"),
-                                                     need_grad=True, compute_log_probs=True,
-                                                     encoded_batch=None)
-                # get log_u(samples,h) and detach for reinforce
-                log_uh = torch.log(u_h).detach().to(sample_log_probs.device)
-                utility_term = torch.mean(log_uh * sample_log_probs)
-                if torch.isinf(utility_term).any():
-                    logger.info("INF UTILITY" * 100)
-                    logger.info(f"log_uh is inf? {torch.isinf(log_uh).any()}")
-                    logger.info(f"sample_log_probs is inf? {torch.isinf(sample_log_probs).any()}")
+                batch_loss, log_dict = self.loss_function.utility_loss(model=self,
+                                                                       batch=kwargs['batch'],
+                                                                       batch_loss=batch_loss,
+                                                                       utility_type=kwargs['utility_type'],
+                                                                       encoded_batch=None,
+                                                                       samples_raw=kwargs.get('samples', None),
+                                                                       log_probs_0=kwargs.get('log_probs_0', 0))
+                # (encoder_output, encoder_hidden))
 
-                if torch.isinf(batch_loss).any():
-                    logger.info("INF batch loss")
-                # logger.info(f"Batch loss {batch_loss}, Utility term {utility_term}")
-                batch_loss += utility_term * self._utility_alpha
+            else:
+                if return_type == "loss":
+                    log_dict = {"nll": batch_loss.item(), "utility_term": None, "u_h": None, 'samples_raw': None,
+                                "log_probs_0": 0}
+                else:
+                    log_dict = None
 
-            # return batch loss
-            #     = sum over all elements in batch that are not pad
-            return_tuple = (batch_loss, None, None, None)
+            return_tuple = (batch_loss, log_dict)
+            # add the encoded batch to output
+            # if kwargs.get("return_encoded", False):
+            #     return_tuple += (log_dict.get('samples_raw', None), log_dict.get("log_probs_0", 0))
+
+            # elif kwargs.get("k", 0) != 0 and utility_reg \
+            if kwargs.get("return_encoded", False):
+                return_tuple += (encoder_output, encoder_hidden)
+            else:
+                return_tuple += (None, None)
 
         elif return_type == "encode":
             encoder_output, encoder_hidden = self._encode(**kwargs)
@@ -227,6 +230,16 @@ class Model(nn.Module):
 
 class _DataParallel(nn.DataParallel):
     """ DataParallel wrapper to pass through the model attributes """
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.module, name)
+
+
+class _DistributedDataParallel(nn.parallel.DistributedDataParallel):
+    """ DistributedDataParallel wrapper to pass through the model attributes """
 
     def __getattr__(self, name):
         try:

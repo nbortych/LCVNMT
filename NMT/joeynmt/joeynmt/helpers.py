@@ -19,7 +19,7 @@ import torch
 from torch import nn, Tensor
 from torch.utils.tensorboard import SummaryWriter
 
-from torchtext.data import Dataset
+from torchtext.legacy.data import Dataset
 import yaml
 from joeynmt.vocabulary import Vocabulary
 from joeynmt.plotting import plot_heatmap
@@ -154,8 +154,8 @@ def log_data_info(train_data: Dataset, valid_data: Dataset, test_data: Dataset,
                 len(test_data) if test_data is not None else 0)
 
     logger.info("First training example:\n\t[SRC] %s\n\t[TRG] %s",
-                " ".join(vars(train_data[0])['src']),
-                " ".join(vars(train_data[0])['trg']))
+                " ".join(train_data[0][0]),
+                " ".join(train_data[0][2]))
 
     logger.info(
         "First 10 words (src): %s",
@@ -267,7 +267,7 @@ def get_latest_checkpoint(ckpt_dir: str) -> Optional[str]:
     return latest_checkpoint
 
 
-def load_checkpoint(path: str, use_cuda: bool = True) -> dict:
+def load_checkpoint(path: str, use_cuda: bool = True, ddp=False, rank=None) -> dict:
     """
     Load model from saved checkpoint.
 
@@ -276,7 +276,14 @@ def load_checkpoint(path: str, use_cuda: bool = True) -> dict:
     :return: checkpoint (dict)
     """
     assert os.path.isfile(path), "Checkpoint %s not found" % path
-    checkpoint = torch.load(path, map_location='cuda' if use_cuda else 'cpu')
+    # if DDP, map to different gpus
+    if not ddp:
+        map_location = 'cuda' if use_cuda else 'cpu'
+    else:
+        assert rank is not None, "Rank is None"
+        map_location = {'cuda:%d' % 0: 'cuda:%d' % rank}
+
+    checkpoint = torch.load(path, map_location=map_location)
     return checkpoint
 
 
@@ -356,3 +363,23 @@ def latest_checkpoint_update(target: pathlib.Path,
         return current_last
     link.symlink_to(target)
     return None
+
+
+def debug_memory():
+    import collections, gc, resource, torch
+    print('maxrss = {}'.format(
+        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss), flush=True)
+    tensors = collections.Counter((str(o.device), o.dtype, tuple(o.shape))
+                                  for o in gc.get_objects()
+                                  if torch.is_tensor(o))
+    for line in tensors.items():
+        print('{}\t{}'.format(*line), flush=True)
+
+
+def repeat_batch(batch, num_repeats):
+    new_batch = copy.deepcopy(batch)
+    new_batch.src = new_batch.src.repeat(num_repeats, 1)
+    new_batch.src_mask = new_batch.src_mask.repeat(num_repeats, 1, 1)
+    new_batch.trg_mask = new_batch.trg_mask.repeat(num_repeats, 1, 1)
+    new_batch.src_length = new_batch.src_length.repeat(num_repeats)
+    return new_batch
