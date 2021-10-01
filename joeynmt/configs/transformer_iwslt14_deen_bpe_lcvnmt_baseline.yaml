@@ -25,10 +25,10 @@ testing:
     utility: "chrf"
     num_samples: 10
     save_utility_per_sentence: True
-    all_decoding_types: False
+    all_decoding_types: True
     multi_utility: True
     only_test: True
-    multi_mbr: True
+    multi_mbr: False
 
 training:
     load_model: "models/iwslt14_deen_bpe_transformer_baseline_pretrain/best.ckpt" #  based on pretrained bnn

@@ -4,12 +4,12 @@
 #_short
 #_shared
 #SBATCH --gres=gpu:1
-#SBATCH --job-name=DDP_regulariser
+#SBATCH --job-name=lcvnmt
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --time=01:00:00
+#SBATCH --time=03:00:00
 #SBATCH --mem=64000M
-#SBATCH --output=../slurm/slurm_output_%A_regulariser_3_test_gpu.out
+#SBATCH --output=../slurm/slurm_output_%A_test_lcvnmt.out
 
 module purge
 module load 2019
@@ -37,4 +37,4 @@ export BEER_HOME=./beer_2.0
 chmod +x ./beer_2.0/scripts/interactive
 
 # Run your code
-srun python -m joeynmt test configs/transformer_iwslt14_deen_bpe_regulariser.yaml #
+srun python -m joeynmt test configs/transformer_iwslt14_deen_bpe_lcvnmt_bnn_best.yaml #
