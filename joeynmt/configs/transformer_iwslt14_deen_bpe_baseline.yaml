@@ -1,4 +1,4 @@
-name: "iwslt14-deen-bpe-transformer"
+name: "iwslt14-deen-bpe-transformer-baseline"
 
 data:
     src: "de"
@@ -29,7 +29,6 @@ testing:
     multi_utility: True
     only_test: True
 training:
-#    load_model: "models/iwslt14_deen_bpe_transformer_baseline_0_cp/211000.ckpt"
     random_seed: 42
     optimizer: "adam"
     normalization: "tokens"
@@ -50,8 +49,7 @@ training:
     validation_freq: 1000
     logging_freq: 100
     eval_metric: ''
-#    model_dir: "models/iwslt14_deen_bpe_transformer_precalibration_1"
-    model_dir: "models/iwslt14_deen_bpe_transformer_baseline_5"
+    model_dir: "models/iwslt14_deen_bpe_transformer_baseline"
     overwrite: False
     shuffle: True
     use_cuda: True

@@ -25,31 +25,34 @@ testing:
     utility: "chrf"
     num_samples: 10
     save_utility_per_sentence: True
+    all_decoding_types: False
+    multi_utility: True
+    only_test: True
+    multi_mbr: True
 
 training:
-    load_model: "models/iwslt14_deen_bpe_transformer_bnn_4/latest.ckpt"
     random_seed: 42
     optimizer: "adam"
     normalization: "tokens"
     adam_betas: [0.9, 0.999]
     scheduling: "plateau"
-    patience: 6
+    patience: 10
     decrease_factor: 0.7
     loss: "crossentropy"
-    learning_rate: 0.003
+    learning_rate: 0.0003
     learning_rate_min: 0.00000001
     weight_decay: 0.0001
     label_smoothing: 0
     batch_size: 128
-#    eval_batch_size: 64
+    eval_batch_size: 1 #0
     batch_type: "sentence"
     early_stopping_metric: "utility"
-    epochs: 2
-    validation_freq: 500
+    epochs: 100
+    validation_freq: 1000
     logging_freq: 100
     eval_metric: ''
-    model_dir: "models/iwslt14_deen_bpe_transformer_bnn_4_cp"
-    overwrite: True
+    model_dir: "models/iwslt14_deen_bpe_transformer_bnn"
+    overwrite: False
     shuffle: True
     use_cuda: True
     max_output_length: 50 #50
@@ -57,7 +60,7 @@ training:
     sampling_max_buffer: 5
     print_valid_sents: [0, 1, 2, 3, 4]
     keep_last_ckpts: 5
-    checkpoint_epoch: 20
+    checkpoint_epoch: 200
     # LC-NMT specific things
     track_mbr: True
     mbr_type: "editdistance"

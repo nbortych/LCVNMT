@@ -30,10 +30,7 @@ testing:
     only_test: True
 
 training:
-#    load_model: "models/iwslt14_deen_bpe_transformer_lcvnmt_1_cp/latest.ckpt" # checkpoint
-#    load_model: "models/iwslt14_deen_bpe_transformer_bnn_3_lr0/best.ckpt" #  based on best bnn
-    load_model: "models/iwslt14_deen_bpe_transformer_bnn_3_lr0_pretrain/best.ckpt" #  based on pretrained bnn
-#    load_model: "models/iwslt14_deen_bpe_transformer_precalibration_1/best.ckpt" # checkpoint based on baseline pretrained
+    load_model: "models/iwslt14_deen_bpe_transformer_bnn_pretrain/best.ckpt" #  based on pretrained bnn
     reset_best_ckpt: True
     reset_scheduler: True
     reset_optimizer: True
@@ -51,15 +48,12 @@ training:
     label_smoothing: 0
     batch_size: 10
     batch_multiplier: 12
-#    eval_batch_size: 64
     batch_type: "sentence"
     early_stopping_metric: "utility"
     epochs: 2
     validation_freq: 10000
     logging_freq: 500
     eval_metric: ''
-    # 0 - lcvnmt based on baseline, 1 based on best bnn,2 form scratch,  3 based on pretrained bnn
-#    model_dir: "models/iwslt14_deen_bpe_transformer_lcvnmt_1_cp1"
     model_dir: "models/iwslt14_deen_bpe_transformer_lcvnmt_big_batch"
     overwrite: False
     shuffle: True
