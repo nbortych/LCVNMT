@@ -1,4 +1,4 @@
-# LCNMT
+# LCVNMT
 This repository is for my MSc. thesis project which will introduce loss calibrated variational inference for structured prediction problem, specifically to the NMT problem. I coined it Loss calibrated variational machine translation. 
 
 In the following table you can find the job files you need to run to reproduce different methods. All of these files can be found in the folder joeynmt/job_files. If you want to see the hyper parameters, you can find corresponding yaml files in joeynmt/configs. 
